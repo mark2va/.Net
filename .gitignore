@@ -1,0 +1,12 @@
+```
+# Build artifacts
+*.obj
+*.exe
+*.dll
+*.pdb
+*.userprefs
+# Dependencies
+packages/
+# Logs
+*.log
+```
