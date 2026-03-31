@@ -3,29 +3,19 @@
 *.exe
 *.dll
 *.pdb
-*.userprefs
-*.cache
-bin/
-obj/
+*.config
+packages.config
+Deobfuscator/bin/
+Deobfuscator/obj/
 Debug/
 Release/
-x64/
-x86/
 
 # Dependencies
 packages/
-node_modules/
-venv/
-.venv/
-__pycache__/
-*.egg-info/
 
 # Logs and temp files
 *.log
 *.tmp
-*.temp
-*.user
-*.suo
 
 # Environment
 .env
@@ -38,7 +28,7 @@ __pycache__/
 *.swp
 *.swo
 
-# OS
+# OS generated files
 .DS_Store
 Thumbs.db
 ```
