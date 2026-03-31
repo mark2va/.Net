@@ -1,131 +1,220 @@
 using System;
-using System.Collections.Generic;
+using System.IO;
 using System.Net.Http;
 using System.Text;
-using System.Text.Json;
 using System.Threading.Tasks;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace Deobfuscator
 {
     /// <summary>
-    /// Класс для взаимодействия с локальными ИИ-серверами (Ollama, LM Studio и др.)
+    /// Класс для взаимодействия с локальными AI-серверами (Ollama, LM Studio и др.)
     /// </summary>
     public class AiAssistant
     {
-        private readonly HttpClient _httpClient;
         private readonly AiConfig _config;
+        private readonly HttpClient _httpClient;
 
+        /// <summary>
+        /// Создать AI-ассистента с указанной конфигурацией
+        /// </summary>
         public AiAssistant(AiConfig config)
         {
             _config = config;
             _httpClient = new HttpClient();
             _httpClient.Timeout = TimeSpan.FromSeconds(config.TimeoutSeconds);
+            _httpClient.DefaultRequestHeaders.Add("Content-Type", "application/json");
         }
 
         /// <summary>
-        /// Анализирует метод и предлагает новые имена для переменных и методов
+        /// Переименовать метод на основе его кода
         /// </summary>
-        public async Task<AiAnalysisResult?> AnalyzeMethodAsync(string methodName, string ilCode)
+        public async Task<string> SuggestMethodName(string methodCode, string currentName)
         {
-            var prompt = $@\"You are an expert .NET reverse engineer. 
-Analyze the following IL code for method '{methodName}'.
-Your task is to:
-1. Identify the purpose of the method.
-2. Suggest meaningful names for local variables based on their usage.
-3. Suggest a better name for the method itself if 'method' or obfuscated name is used.
-
-Return ONLY a valid JSON object with this structure:
-{{
-    \"\"methodName\"\": \"\"SuggestedMethodName\"\",
-    \"\"variables\"\": {{
-        \"\"V_0\"\": \"\"suggestedName1\"\",
-        \"\"V_1\"\": \"\"suggestedName2\"\"
-    }},
-    \"\"comment\"\": \"\"Brief description of what the method does\"\"
-}}
-
-IL Code:
-```il
-{ilCode}
-```
-
-If you cannot determine meaningful names, return an empty JSON object {{}}. Do not include markdown formatting like ```json.\";
+            if (!_config.Enabled)
+                return currentName;
 
             try
             {
-                var requestBody = new
-                {
-                    model = _config.Model,
-                    prompt = prompt,
-                    stream = false,
-                    options = new
-                    {
-                        temperature = 0.2, // Низкая температура для более детерминированного ответа
-                        num_predict = 500
-                    }
-                };
+                var prompt = $@"Analyze this C# method and suggest a meaningful name (single word or short phrase, camelCase). 
+Current obfuscated name: {currentName}
+Method code:
+{methodCode}
 
-                var content = new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, \"application/json\");
+Respond with ONLY the suggested name, nothing else.";
+
+                var response = await SendPromptAsync(prompt);
                 
-                // Используем endpoint из конфигурации
-                var response = await _httpClient.PostAsync(_config.GenerateEndpoint, content);
-                
-                if (response.IsSuccessStatusCode)
+                if (!string.IsNullOrWhiteSpace(response))
                 {
-                    var jsonResponse = await response.Content.ReadAsStringAsync();
-                    using var doc = JsonDocument.Parse(jsonResponse);
-                    
-                    if (doc.RootElement.TryGetProperty(\"response\", out var responseElement))
-                    {
-                        var aiText = responseElement.GetString();
-                        return ParseAiResponse(aiText);
-                    }
-                }
-                else
-                {
-                    Console.WriteLine($\"[AI] Error: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}\");
+                    // Очистить ответ от лишних символов
+                    var cleanName = response.Trim().Trim('"', '\'', '`', '.');
+                    if (!string.IsNullOrWhiteSpace(cleanName) && cleanName.Length <= 50)
+                        return cleanName;
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($\"[AI] Exception during analysis: {ex.Message}\");
+                Console.WriteLine($"[AI] Ошибка при переименовании метода: {ex.Message}");
             }
 
-            return null;
+            return currentName;
         }
 
-        private AiAnalysisResult? ParseAiResponse(string text)
+        /// <summary>
+        /// Переименовать переменную на основе контекста
+        /// </summary>
+        public async Task<string> SuggestVariableName(string context, string currentName, string variableType)
+        {
+            if (!_config.Enabled)
+                return currentName;
+
+            try
+            {
+                var prompt = $@"Analyze this C# code context and suggest a meaningful variable name (camelCase).
+Variable type: {variableType}
+Current obfuscated name: {currentName}
+Context:
+{context}
+
+Respond with ONLY the suggested name, nothing else.";
+
+                var response = await SendPromptAsync(prompt);
+                
+                if (!string.IsNullOrWhiteSpace(response))
+                {
+                    var cleanName = response.Trim().Trim('"', '\'', '`', '.');
+                    if (!string.IsNullOrWhiteSpace(cleanName) && cleanName.Length <= 30)
+                        return cleanName;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[AI] Ошибка при переименовании переменной: {ex.Message}");
+            }
+
+            return currentName;
+        }
+
+        /// <summary>
+        /// Добавить комментарий к методу
+        /// </summary>
+        public async Task<string> GenerateMethodComment(string methodCode)
+        {
+            if (!_config.Enabled)
+                return string.Empty;
+
+            try
+            {
+                var prompt = $@"Analyze this C# method and write a brief XML documentation comment describing what it does.
+Method code:
+{methodCode}
+
+Respond with ONLY the XML comment (/// lines), nothing else.";
+
+                var response = await SendPromptAsync(prompt);
+                
+                if (!string.IsNullOrWhiteSpace(response))
+                {
+                    return response.Trim();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[AI] Ошибка при генерации комментария: {ex.Message}");
+            }
+
+            return string.Empty;
+        }
+
+        /// <summary>
+        /// Отправить промпт к AI-серверу
+        /// </summary>
+        private async Task<string> SendPromptAsync(string prompt)
+        {
+            var requestBody = new
+            {
+                model = _config.Model,
+                prompt = prompt,
+                stream = false,
+                options = new
+                {
+                    temperature = 0.3,
+                    top_p = 0.9
+                }
+            };
+
+            var json = JsonConvert.SerializeObject(requestBody);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+            var response = await _httpClient.PostAsync(_config.GetGenerateUrl(), content);
+            
+            if (response.IsSuccessStatusCode)
+            {
+                var responseJson = await response.Content.ReadAsStringAsync();
+                var jsonObject = JObject.Parse(responseJson);
+                
+                // Ollama format
+                if (jsonObject["response"] != null)
+                {
+                    return jsonObject["response"].ToString();
+                }
+                
+                // Generic format
+                if (jsonObject["choices"] != null && jsonObject["choices"][0]["text"] != null)
+                {
+                    return jsonObject["choices"][0]["text"].ToString();
+                }
+            }
+            else
+            {
+                var errorText = await response.Content.ReadAsStringAsync();
+                throw new Exception($"HTTP {response.StatusCode}: {errorText}");
+            }
+
+            return string.Empty;
+        }
+
+        /// <summary>
+        /// Проверить доступность AI-сервера
+        /// </summary>
+        public async Task<bool> CheckConnectionAsync()
         {
             try
             {
-                // Очистка от возможных маркдаун-оберток
-                text = text.Replace(\"```json\", \"\").Replace(\"```\", \"\").Trim();
+                // Попытка получить список моделей (Ollama API)
+                var modelsUrl = $"{_config.GetBaseUrl()}/api/tags";
+                var response = await _httpClient.GetAsync(modelsUrl);
                 
-                // Поиск начала и конца JSON объекта, если ответ содержит лишний текст
-                int start = text.IndexOf('{');
-                int end = text.LastIndexOf('}');
-                
-                if (start != -1 && end != -1 && end > start)
+                if (response.IsSuccessStatusCode)
                 {
-                    text = text.Substring(start, end - start + 1);
+                    Console.WriteLine($"[AI] Успешное подключение к {_config.ApiUrl}");
+                    return true;
                 }
-
-                var result = JsonSerializer.Deserialize<AiAnalysisResult>(text);
-                return result;
+                
+                // Если не удалось получить список моделей, пробуем простой запрос
+                var testResponse = await SendPromptAsync("Say 'OK'");
+                if (!string.IsNullOrWhiteSpace(testResponse))
+                {
+                    Console.WriteLine($"[AI] Успешное подключение к {_config.ApiUrl}");
+                    return true;
+                }
             }
-            catch (JsonException ex)
+            catch (Exception ex)
             {
-                Console.WriteLine($\"[AI] Failed to parse JSON response: {ex.Message}\");
-                Console.WriteLine($\"[AI] Raw response snippet: {text.Substring(0, Math.Min(100, text.Length))}...\");
-                return null;
+                Console.WriteLine($"[AI] Ошибка подключения к {_config.ApiUrl}: {ex.Message}");
             }
-        }
-    }
 
-    public class AiAnalysisResult
-    {
-        public string? methodName { get; set; }
-        public Dictionary<string, string>? variables { get; set; }
-        public string? comment { get; set; }
+            return false;
+        }
+
+        /// <summary>
+        /// Освободить ресурсы
+        /// </summary>
+        public void Dispose()
+        {
+            _httpClient?.Dispose();
+        }
     }
 }
