@@ -15,18 +15,18 @@ public class UniversalDeobfuscator
     private readonly AiAssistant? _aiAssistant;
     private readonly bool _useAi;
 
-    public UniversalDeobfuscator(ModuleDefMD module, bool useAi = false, string aiBaseUrl = "http://localhost:11434", string aiModel = "codellama")
+    public UniversalDeobfuscator(ModuleDefMD module, AiConfig? aiConfig = null)
     {
         _module = module;
         _corLibTypes = module.CorLibTypes;
         
-        if (useAi)
+        if (aiConfig != null && aiConfig.Enabled)
         {
             try
             {
-                _aiAssistant = new AiAssistant(aiBaseUrl, aiModel);
+                _aiAssistant = new AiAssistant(aiConfig);
                 _useAi = true;
-                Console.WriteLine($"[AI] Connected to AI assistant at {aiBaseUrl} using model: {aiModel}");
+                Console.WriteLine($"[AI] Connected to AI assistant at {aiConfig.ApiUrl} using model: {aiConfig.Model}");
             }
             catch (Exception ex)
             {

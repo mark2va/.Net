@@ -1,38 +1,12 @@
 ```
 # Build artifacts
+*.obj
 *.exe
 *.dll
 *.pdb
-bin/
-obj/
-Debug/
-Release/
-
+*.userprefs
 # Dependencies
 packages/
-nuget/
-.nuget/
-
-# Logs and temp files
+# Logs
 *.log
-*.tmp
-*.swp
-
-# Environment
-.env
-.env.local
-*.env.*
-
-# Editors
-.vscode/
-.idea/
-*.userprefs
-*.user
-*.suo
-*.userosscache
-*.sln.docstates
-
-# OS generated files
-.DS_Store
-Thumbs.db
 ```

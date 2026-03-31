@@ -75,10 +75,11 @@ switch (x) {
 - Любые другие совместимые API серверы
 
 Рекомендуемые модели:
+- `llama3` - современная универсальная модель (рекомендуется по умолчанию)
 - `codellama` - специализированная модель для кода
-- `llama2` - универсальная модель
 - `mistral` - быстрая и эффективная модель
 - `deepseek-coder` - отличная модель для анализа кода
+- `qwen2.5-coder` - мощная модель для работы с кодом
 
 ## Сборка
 
@@ -116,44 +117,78 @@ Deobfuscator.exe obfuscated.exe cleaned.exe
 ```
 
 ### С использованием AI-ассистента
+
 ```bash
-# С настройками по умолчанию (Ollama + codellama)
+# С настройками по умолчанию (Ollama + llama3)
 dotnet run -- obfuscated.exe cleaned.exe --ai
 
 # С указанием URL сервера (например, LM Studio)
 dotnet run -- obfuscated.exe cleaned.exe --ai --ai-url http://localhost:1234
 
 # С выбором модели
-dotnet run -- obfuscated.exe cleaned.exe --ai --ai-model llama2
+dotnet run -- obfuscated.exe cleaned.exe --ai --ai-model codellama
+
+# С изменением таймаута (для больших методов)
+dotnet run -- obfuscated.exe cleaned.exe --ai --ai-timeout 180
 
 # Полная конфигурация
-dotnet run -- obfuscated.exe cleaned.exe --ai --ai-url http://localhost:11434 --ai-model deepseek-coder
+dotnet run -- obfuscated.exe cleaned.exe --ai --ai-url http://localhost:11434 --ai-model deepseek-coder --ai-timeout 120
+```
+
+#### Примеры команд для разных серверов:
+
+**Ollama:**
+```bash
+# Запуск с моделью llama3
+dotnet run -- input.exe output.exe --ai --ai-model llama3
+
+# Запуск с моделью codellama
+dotnet run -- input.exe output.exe --ai --ai-model codellama
+```
+
+**LM Studio:**
+```bash
+# Запуск с локальным сервером LM Studio
+dotnet run -- input.exe output.exe --ai --ai-url http://localhost:1234 --ai-model your-model-name
+```
+
+**Другие совместимые серверы:**
+```bash
+# Любой OpenAI-совместимый API
+dotnet run -- input.exe output.exe --ai --ai-url http://your-server:port --ai-model model-name --ai-timeout 300
 ```
 
 ### Примеры использования AI
 
 #### Ollama
 1. Установите Ollama: https://ollama.ai
-2. Загрузите модель: `ollama pull codellama`
-3. Запустите: `dotnet run -- input.exe output.exe --ai`
+2. Загрузите модель: `ollama pull llama3` или `ollama pull codellama`
+3. Запустите: `dotnet run -- input.exe output.exe --ai --ai-model llama3`
 
 #### LM Studio
 1. Установите LM Studio: https://lmstudio.ai
-2. Загрузите любую модель для кода
-3. Запустите локальный сервер в LM Studio
+2. Загрузите любую модель для кода (например, Codellama, DeepSeek-Coder)
+3. Запустите локальный сервер в LM Studio (обычно на порту 1234)
 4. Запустите деобфускатор: `dotnet run -- input.exe output.exe --ai --ai-url http://localhost:1234 --ai-model your-model-name`
+
+#### Настройка таймаута
+Для больших методов или медленных моделей увеличьте таймаут:
+```bash
+dotnet run -- input.exe output.exe --ai --ai-timeout 300
+```
 
 ## Архитектура
 
 ### Основные компоненты
 
-1. **UniversalDeobfuscator** - главный класс, координирующий все этапы деобфускации
+1. **AiConfig** - конфигурация AI-сервера (URL, модель, таймаут)
 2. **AiAssistant** - класс для взаимодействия с локальными AI-серверами
-3. **SimplifyConstantConditions** - упрощение условий с константами
-4. **UnravelControlFlow** - распутывание потоков управления
-5. **RemoveDeadCode** - удаление мертвого кода
-6. **SimplifyBranches** - оптимизация ветвлений
-7. **ApplyAiRenamingAsync** - AI-ассистированное переименование
+3. **UniversalDeobfuscator** - главный класс, координирующий все этапы деобфускации
+4. **SimplifyConstantConditions** - упрощение условий с константами
+5. **UnravelControlFlow** - распутывание потоков управления
+6. **RemoveDeadCode** - удаление мертвого кода
+7. **SimplifyBranches** - оптимизация ветвлений
+8. **ApplyAiRenamingAsync** - AI-ассистированное переименование
 
 ### Алгоритм работы
 
@@ -222,10 +257,21 @@ IL_0005: br.s IL_0000
 
 ## Советы по использованию AI
 
-1. **Выбор модели**: Используйте специализированные модели для кода (codellama, deepseek-coder)
+1. **Выбор модели**: Используйте специализированные модели для кода (codellama, deepseek-coder, qwen2.5-coder)
 2. **Размер контекста**: Убедитесь, что модель поддерживает достаточный размер контекста
-3. **Локальность**: AI работает полностью локально - ваши данные не отправляются в облако
-4. **Отключение**: Если AI не нужен, просто не используйте флаг `--ai`
+3. **Таймаут**: Для больших методов увеличьте таймаут через `--ai-timeout`
+4. **Локальность**: AI работает полностью локально - ваши данные не отправляются в облако
+5. **Отключение**: Если AI не нужен, просто не используйте флаг `--ai`
+6. **Гибкая настройка**: Меняйте URL сервера, модель и таймаут в зависимости от ваших нужд
+
+## Параметры командной строки AI
+
+| Параметр | Описание | По умолчанию | Пример |
+|----------|----------|--------------|--------|
+| `--ai` | Включить AI-ассистента | выключено | `--ai` |
+| `--ai-url <url>` | URL AI-сервера | `http://localhost:11434` | `--ai-url http://localhost:1234` |
+| `--ai-model <name>` | Имя модели | `llama3` | `--ai-model codellama` |
+| `--ai-timeout <secs>` | Таймаут в секундах | `120` | `--ai-timeout 300` |
 
 ## Лицензия
 

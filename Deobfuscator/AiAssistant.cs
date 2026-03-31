@@ -13,15 +13,13 @@ namespace Deobfuscator
     public class AiAssistant
     {
         private readonly HttpClient _httpClient;
-        private readonly string _baseUrl;
-        private readonly string _model;
+        private readonly AiConfig _config;
 
-        public AiAssistant(string baseUrl = "http://localhost:11434", string model = "codellama")
+        public AiAssistant(AiConfig config)
         {
-            _baseUrl = baseUrl.TrimEnd('/');
-            _model = model;
+            _config = config;
             _httpClient = new HttpClient();
-            _httpClient.Timeout = TimeSpan.FromMinutes(2); // Длительный таймаут для анализа кода
+            _httpClient.Timeout = TimeSpan.FromSeconds(config.TimeoutSeconds);
         }
 
         /// <summary>
@@ -29,7 +27,7 @@ namespace Deobfuscator
         /// </summary>
         public async Task<AiAnalysisResult?> AnalyzeMethodAsync(string methodName, string ilCode)
         {
-            var prompt = $@"You are an expert .NET reverse engineer. 
+            var prompt = $@\"You are an expert .NET reverse engineer. 
 Analyze the following IL code for method '{methodName}'.
 Your task is to:
 1. Identify the purpose of the method.
@@ -38,12 +36,12 @@ Your task is to:
 
 Return ONLY a valid JSON object with this structure:
 {{
-    ""methodName"": ""SuggestedMethodName"",
-    ""variables"": {{
-        ""V_0"": ""suggestedName1"",
-        ""V_1"": ""suggestedName2""
+    \"\"methodName\"\": \"\"SuggestedMethodName\"\",
+    \"\"variables\"\": {{
+        \"\"V_0\"\": \"\"suggestedName1\"\",
+        \"\"V_1\"\": \"\"suggestedName2\"\"
     }},
-    ""comment"": ""Brief description of what the method does""
+    \"\"comment\"\": \"\"Brief description of what the method does\"\"
 }}
 
 IL Code:
@@ -51,13 +49,13 @@ IL Code:
 {ilCode}
 ```
 
-If you cannot determine meaningful names, return an empty JSON object {{}}. Do not include markdown formatting like ```json.";
+If you cannot determine meaningful names, return an empty JSON object {{}}. Do not include markdown formatting like ```json.\";
 
             try
             {
                 var requestBody = new
                 {
-                    model = _model,
+                    model = _config.Model,
                     prompt = prompt,
                     stream = false,
                     options = new
@@ -67,17 +65,17 @@ If you cannot determine meaningful names, return an empty JSON object {{}}. Do n
                     }
                 };
 
-                var content = new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, "application/json");
+                var content = new StringContent(JsonSerializer.Serialize(requestBody), Encoding.UTF8, \"application/json\");
                 
-                // Ollama API endpoint
-                var response = await _httpClient.PostAsync($"{_baseUrl}/api/generate", content);
+                // Используем endpoint из конфигурации
+                var response = await _httpClient.PostAsync(_config.GenerateEndpoint, content);
                 
                 if (response.IsSuccessStatusCode)
                 {
                     var jsonResponse = await response.Content.ReadAsStringAsync();
                     using var doc = JsonDocument.Parse(jsonResponse);
                     
-                    if (doc.RootElement.TryGetProperty("response", out var responseElement))
+                    if (doc.RootElement.TryGetProperty(\"response\", out var responseElement))
                     {
                         var aiText = responseElement.GetString();
                         return ParseAiResponse(aiText);
@@ -85,12 +83,12 @@ If you cannot determine meaningful names, return an empty JSON object {{}}. Do n
                 }
                 else
                 {
-                    Console.WriteLine($"[AI] Error: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}");
+                    Console.WriteLine($\"[AI] Error: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}\");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[AI] Exception during analysis: {ex.Message}");
+                Console.WriteLine($\"[AI] Exception during analysis: {ex.Message}\");
             }
 
             return null;
@@ -101,7 +99,7 @@ If you cannot determine meaningful names, return an empty JSON object {{}}. Do n
             try
             {
                 // Очистка от возможных маркдаун-оберток
-                text = text.Replace("```json", "").Replace("```", "").Trim();
+                text = text.Replace(\"```json\", \"\").Replace(\"```\", \"\").Trim();
                 
                 // Поиск начала и конца JSON объекта, если ответ содержит лишний текст
                 int start = text.IndexOf('{');
@@ -117,8 +115,8 @@ If you cannot determine meaningful names, return an empty JSON object {{}}. Do n
             }
             catch (JsonException ex)
             {
-                Console.WriteLine($"[AI] Failed to parse JSON response: {ex.Message}");
-                Console.WriteLine($"[AI] Raw response snippet: {text.Substring(0, Math.Min(100, text.Length))}...");
+                Console.WriteLine($\"[AI] Failed to parse JSON response: {ex.Message}\");
+                Console.WriteLine($\"[AI] Raw response snippet: {text.Substring(0, Math.Min(100, text.Length))}...\");
                 return null;
             }
         }
