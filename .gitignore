@@ -1,27 +1,25 @@
 ```
 # Build artifacts
-*.exe
-*.dll
-*.pdb
 bin/
 obj/
-Debug/
-Release/
-
+*.dll
+*.exe
+*.pdb
+*.config
+*.manifest
+*.lockb
 # Dependencies
 packages/
-
 # Logs
 *.log
-
 # Environment
 .env
 .env.local
-*.env.*
-
 # Editors
-.vs/
+.vscode/
 .idea/
-*.userprefs
 *.user
+*.userosscache
+*.suo
+*.csproj.user
 ```
