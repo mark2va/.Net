@@ -1,25 +1,44 @@
 ```
 # Build artifacts
+*.exe
+*.dll
+*.pdb
+*.userprefs
+*.cache
 bin/
 obj/
-*.dll
-*.exe
-*.pdb
-*.config
-*.manifest
-*.lockb
+Debug/
+Release/
+x64/
+x86/
+
 # Dependencies
 packages/
-# Logs
+node_modules/
+venv/
+.venv/
+__pycache__/
+*.egg-info/
+
+# Logs and temp files
 *.log
+*.tmp
+*.temp
+*.user
+*.suo
+
 # Environment
 .env
 .env.local
+*.env.*
+
 # Editors
 .vscode/
 .idea/
-*.user
-*.userosscache
-*.suo
-*.csproj.user
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
 ```
