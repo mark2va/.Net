@@ -1,112 +1,157 @@
 using System;
 using System.IO;
-using System.CommandLine;
-using System.CommandLine.Invocation;
-using System.Threading.Tasks;
-using dnlib.DotNet;
 
 namespace Deobfuscator
 {
     class Program
     {
-        static async Task<int> Main(string[] args)
+        static void Main(string[] args)
         {
-            Console.WriteLine("=== Универсальный .NET Деобфускатор ===");
-            Console.WriteLine("На основе dnlib с поддержкой AI-ассистента\n");
-
-            // Определяем аргументы командной строки
-            var inputArg = new Argument<string>("input", "Входной обфусцированный файл (.exe/.dll)");
-            var outputArg = new Argument<string>("output", "Выходной очищенный файл");
-            
-            var aiOption = new Option<bool>("--ai", "Включить AI-ассистента для переименования")
+            if (args.Length < 2)
             {
-                Arity = ArgumentArity.Zero
-            };
-            
-            var aiUrlOption = new Option<string>(
-                new[] { "--ai-url" }, 
-                () => "http://localhost:11434",
-                "URL AI-сервера (по умолчанию: http://localhost:11434 для Ollama)"
-            );
-            
-            var aiModelOption = new Option<string>(
-                new[] { "--ai-model" }, 
-                () => "llama3",
-                "Имя AI-модели (например: llama3, codellama, deepseek-coder, mistral)"
-            );
-            
-            var aiTimeoutOption = new Option<int>(
-                new[] { "--ai-timeout" }, 
-                () => 120,
-                "Таймаут запросов к AI в секундах (по умолчанию: 120)"
-            );
+                PrintUsage();
+                return;
+            }
 
-            var rootCommand = new RootCommand("Универсальный деобфускатор .NET сборок с поддержкой AI")
+            string inputFile = args[0];
+            string outputFile = args[1];
+            
+            // Настройки AI по умолчанию
+            var aiConfig = new AiConfig
             {
-                inputArg,
-                outputArg,
-                aiOption,
-                aiUrlOption,
-                aiModelOption,
-                aiTimeoutOption
+                Enabled = false,
+                ApiUrl = "http://localhost:11434",
+                Model = "llama3",
+                TimeoutSeconds = 120
             };
 
-            rootCommand.Handler = CommandHandler.Create(
-                async (string input, string output, bool ai, string aiUrl, string aiModel, int aiTimeout) =>
+            // Парсинг аргументов командной строки
+            for (int i = 2; i < args.Length; i++)
+            {
+                switch (args[i].ToLower())
                 {
-                    try
-                    {
-                        // Проверка входного файла
-                        if (!File.Exists(input))
+                    case "--ai":
+                        aiConfig.Enabled = true;
+                        break;
+                    
+                    case "--ai-url":
+                        if (i + 1 < args.Length)
                         {
-                            Console.WriteLine($"[!] Ошибка: Файл '{input}' не найден.");
-                            return 1;
-                        }
-
-                        Console.WriteLine($"[*] Загрузка сборки: {input}");
-                        
-                        // Загружаем модуль с помощью dnlib
-                        var module = ModuleDefMD.Load(input);
-                        
-                        // Настраиваем AI конфигурацию
-                        AiConfig aiConfig = null;
-                        if (ai)
-                        {
-                            aiConfig = new AiConfig(aiUrl, aiModel, aiTimeout);
-                            Console.WriteLine($"[*] AI включен: {aiConfig}");
+                            aiConfig.ApiUrl = args[++i];
                         }
                         else
                         {
-                            Console.WriteLine("[*] AI отключен (используйте --ai для включения)");
+                            Console.WriteLine("[!] Ошибка: --ai-url требует указания URL");
+                            return;
                         }
+                        break;
+                    
+                    case "--ai-model":
+                        if (i + 1 < args.Length)
+                        {
+                            aiConfig.Model = args[++i];
+                        }
+                        else
+                        {
+                            Console.WriteLine("[!] Ошибка: --ai-model требует указания имени модели");
+                            return;
+                        }
+                        break;
+                    
+                    case "--ai-timeout":
+                        if (i + 1 < args.Length)
+                        {
+                            int timeout;
+                            if (int.TryParse(args[++i], out timeout))
+                            {
+                                aiConfig.TimeoutSeconds = timeout;
+                            }
+                            else
+                            {
+                                Console.WriteLine("[!] Ошибка: --ai-timeout требует числовое значение");
+                                return;
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine("[!] Ошибка: --ai-timeout требует указания времени в секундах");
+                            return;
+                        }
+                        break;
+                    
+                    case "--help":
+                    case "-h":
+                        PrintUsage();
+                        return;
+                }
+            }
 
-                        // Создаем деобфускатор и запускаем процесс
-                        var deobfuscator = new UniversalDeobfuscator(module, aiConfig);
-                        var changesCount = await deobfuscator.DeobfuscateAsync();
+            // Проверка входного файла
+            if (!File.Exists(inputFile))
+            {
+                Console.WriteLine($"[!] Ошибка: Файл не найден: {inputFile}");
+                return;
+            }
 
-                        // Сохраняем результат
-                        Console.WriteLine($"\n[*] Сохранение результата в: {output}");
-                        module.Write(output);
-                        
-                        Console.WriteLine($"\n[+] Деобфускация завершена успешно!");
-                        Console.WriteLine($"[+] Внесено изменений: {changesCount}");
-                        Console.WriteLine($"[+] Результат сохранен в: {output}");
-                        
-                        // Освобождаем ресурсы
-                        module.Dispose();
-                        
-                        return 0;
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"\n[!] Критическая ошибка: {ex.Message}");
-                        Console.WriteLine($"[!] Stack trace: {ex.StackTrace}");
-                        return 1;
-                    }
-                });
+            Console.WriteLine("===========================================");
+            Console.WriteLine("   Универсальный деобфускатор .NET сборок");
+            Console.WriteLine("===========================================");
+            Console.WriteLine();
+            Console.WriteLine($"Входной файл:  {Path.GetFullPath(inputFile)}");
+            Console.WriteLine($"Выходной файл: {Path.GetFullPath(outputFile)}");
+            Console.WriteLine();
 
-            // Парсим и выполняем команду
-            return await rootCommand.InvokeAsync(args);
+            if (aiConfig.Enabled)
+            {
+                Console.WriteLine("AI настройки:");
+                Console.WriteLine($"  Включено:     {aiConfig.Enabled}");
+                Console.WriteLine($"  URL сервера:  {aiConfig.ApiUrl}");
+                Console.WriteLine($"  Модель:       {aiConfig.Model}");
+                Console.WriteLine($"  Таймаут:      {aiConfig.TimeoutSeconds} сек.");
+                Console.WriteLine();
+            }
+
+            try
+            {
+                using (var deobfuscator = new UniversalDeobfuscator(inputFile, aiConfig))
+                {
+                    deobfuscator.Deobfuscate();
+                    deobfuscator.Save(outputFile);
+                }
+
+                Console.WriteLine();
+                Console.WriteLine("[+] Деобфускация успешно завершена!");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine();
+                Console.WriteLine($"[!] Произошла ошибка: {ex.Message}");
+                Console.WriteLine($"Детали: {ex.StackTrace}");
+                Environment.Exit(1);
+            }
+        }
+
+        static void PrintUsage()
+        {
+            Console.WriteLine("Использование:");
+            Console.WriteLine("  Deobfuscator.exe <входной_файл> <выходной_файл> [опции]");
+            Console.WriteLine();
+            Console.WriteLine("Опции:");
+            Console.WriteLine("  --ai              Включить AI переименование методов и переменных");
+            Console.WriteLine("  --ai-url <url>    URL AI сервера (по умолчанию: http://localhost:11434)");
+            Console.WriteLine("  --ai-model <name> Имя модели (по умолчанию: llama3)");
+            Console.WriteLine("  --ai-timeout <s>  Таймаут запроса в секундах (по умолчанию: 120)");
+            Console.WriteLine("  --help, -h        Показать эту справку");
+            Console.WriteLine();
+            Console.WriteLine("Примеры:");
+            Console.WriteLine("  Deobfuscator.exe obfuscated.exe cleaned.exe");
+            Console.WriteLine("  Deobfuscator.exe input.exe output.exe --ai");
+            Console.WriteLine("  Deobfuscator.exe input.exe output.exe --ai --ai-url http://localhost:1234 --ai-model codellama");
+            Console.WriteLine();
+            Console.WriteLine("Поддерживаемые AI серверы:");
+            Console.WriteLine("  - Ollama (http://localhost:11434)");
+            Console.WriteLine("  - LM Studio (http://localhost:1234)");
+            Console.WriteLine("  - Любые OpenAI-совместимые API серверы");
         }
     }
 }
