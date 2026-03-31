@@ -1,12 +1,27 @@
 ```
 # Build artifacts
-*.obj
 *.exe
 *.dll
 *.pdb
-*.userprefs
+bin/
+obj/
+Debug/
+Release/
+
 # Dependencies
 packages/
+
 # Logs
 *.log
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vs/
+.idea/
+*.userprefs
+*.user
 ```
