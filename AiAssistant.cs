@@ -25,26 +25,34 @@ namespace Deobfuscator
 
             try
             {
-                // Ограничиваем размер IL кода, чтобы не превысить лимиты токенов
+                // Ограничим входные данные, чтобы не превысить лимиты токенов
                 string ilSnippet = methodBodyIl.Length > 1000 ? methodBodyIl.Substring(0, 1000) + "..." : methodBodyIl;
 
-                string prompt = $"Analyze this C# method IL code and suggest a meaningful name in camelCase. Return ONLY the name, no explanation.\n" +
+                string prompt = $"You are a reverse engineering expert. Analyze this C# IL code snippet and suggest a concise, meaningful camelCase name for the method. Return ONLY the name, no explanation, no quotes.\n" +
                                 $"Return type: {returnType}\n" +
-                                $"Current name: {currentName}\n" +
-                                $"IL Code snippet:\n{ilSnippet}";
+                                $"Current obfuscated name: {currentName}\n" +
+                                $"IL Code:\n{ilSnippet}";
 
+                // Подготовка тела запроса для Ollama / LM Studio
                 var requestBody = new
                 {
                     model = _config.Model,
                     prompt = prompt,
                     stream = false,
-                    options = new { temperature = 0.1, num_predict = 50 }
+                    options = new { temperature = 0.1, num_predict = 20, stop = new[] { "\n", ".", " " } }
                 };
 
                 string json = JsonConvert.SerializeObject(requestBody);
                 byte[] data = Encoding.UTF8.GetBytes(json);
 
-                _currentRequest = (HttpWebRequest)WebRequest.Create($"{_config.ApiUrl}/api/generate");
+                // Пробуем основной URL
+                string endpoint = $"{_config.ApiUrl}/api/generate";
+                
+                // Если используется OpenAI-compatible API (LM Studio часто использует /v1/chat/completions)
+                // Но для простоты оставим /api/generate как стандарт Ollama. 
+                // Если 404, попробуем альтернативу в catch блоке или проверим ответ.
+
+                _currentRequest = (HttpWebRequest)WebRequest.Create(endpoint);
                 _currentRequest.Method = "POST";
                 _currentRequest.ContentType = "application/json";
                 _currentRequest.Timeout = _config.TimeoutSeconds * 1000;
@@ -54,25 +62,52 @@ namespace Deobfuscator
                     stream.Write(data, 0, data.Length);
                 }
 
-                using (var response = (HttpWebResponse)_currentRequest.GetResponse())
+                HttpWebResponse response;
+                try
+                {
+                    response = (HttpWebResponse)_currentRequest.GetResponse();
+                }
+                catch (WebException we)
+                {
+                    if (we.Response is HttpWebResponse errResp)
+                    {
+                        Console.WriteLine($"[AI] Server returned status: {(int)errResp.StatusCode} {errResp.StatusCode}");
+                        using (var reader = new StreamReader(errResp.GetResponseStream()))
+                        {
+                            Console.WriteLine($"[AI] Error details: {reader.ReadToEnd()}");
+                        }
+                    }
+                    throw;
+                }
+
+                using (response)
                 using (var reader = new StreamReader(response.GetResponseStream()))
                 {
                     string result = reader.ReadToEnd();
-                    var jsonResponse = JObject.Parse(result);
-                    string? suggestion = jsonResponse["response"]?.ToString().Trim();
                     
-                    // Очистка от лишних символов, если модель вернула больше чем имя
-                    if (!string.IsNullOrEmpty(suggestion))
+                    // Парсинг ответа Ollama
+                    var jsonResponse = JObject.Parse(result);
+                    string generatedText = jsonResponse["response"]?.ToString().Trim() ?? "";
+                    
+                    // Очистка от лишних символов
+                    generatedText = generatedText.Replace("\"", "").Replace("`", "").Trim();
+                    
+                    if (string.IsNullOrEmpty(generatedText))
                     {
-                        suggestion = suggestion.Split('\n')[0].Replace("`", "").Replace(" ", "");
-                        return suggestion;
+                        Console.WriteLine("[AI] Empty response received.");
+                        return null;
                     }
-                    return null;
+
+                    return generatedText;
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[AI Warning]: {ex.Message}");
+                Console.WriteLine($"[AI Error]: {ex.Message}");
+                if (ex.Message.Contains("404"))
+                {
+                    Console.WriteLine("[AI Hint]: Ensure your server supports '/api/generate' (Ollama default). For LM Studio, check settings or use compatible mode.");
+                }
                 return null;
             }
             finally
