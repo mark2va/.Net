@@ -9,8 +9,8 @@ namespace Deobfuscator
     public class AiConfig
     {
         public bool Enabled { get; set; }
-        public string Endpoint { get; set; } = "http://localhost:11434/api/generate"; // Пример для Ollama
-        public string Model { get; set; } = "llama3"; // Или ваша модель
+        public string Endpoint { get; set; } = "http://192.168.31.130:11434/api/generate"; // Пример для Ollama
+        public string Model { get; set; } = "codellama"; // Или ваша модель
 
         public AiConfig() { }
     }
