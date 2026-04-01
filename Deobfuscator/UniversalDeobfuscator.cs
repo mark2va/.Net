@@ -48,7 +48,7 @@ namespace Deobfuscator
             }
             Console.WriteLine($"[*] Processed {count} methods.");
         }
-
+/*
         /// <summary>
         /// Эмулирует выполнение метода, чтобы построить линейный поток инструкций,
         /// игнорируя обфусцированные переходы по состоянию.
@@ -203,7 +203,161 @@ namespace Deobfuscator
             }
             return false;
         }
-
+*/
+/// <summary>
+        /// Эмулирует выполнение метода, вычисляя значения условий на лету
+        /// и убирая весь мусор обфускации.
+        /// </summary>
+        private void EmulateAndUnravel(MethodDef method)
+        {
+            var body = method.Body;
+            if (body == null) return;
+            // 1. Находим переменную состояния
+            var stateVarInfo = FindStateVariable(method);
+            if (stateVarInfo == null) return;
+            int stateVarIndex = stateVarInfo.Value.Index;
+            object? currentState = stateVarInfo.Value.InitialValue;
+            var instructions = body.Instructions;
+            bool changed = true;
+            int maxPasses = 50;
+            int pass = 0;
+            while (changed && pass < maxPasses)
+            {
+                changed = false;
+                pass++;
+                // Обновляем тело на каждой итерации, если были изменения
+                if (pass > 1) instructions = body.Instructions;
+                for (int i = 0; i < instructions.Count; i++)
+                {
+                    var instr = instructions[i];
+                    // --- Шаг А: Обновление состояния (ldc + stloc) ---
+                    if (IsStloc(instr, out int storeIdx) && storeIdx == stateVarIndex)
+                    {
+                        if (i > 0)
+                        {
+                            var prev = instructions[i - 1];
+                            var val = GetConstantValue(prev);
+                            if (val != null)
+                            {
+                                currentState = val;
+                                // Помечаем эти две инструкции на удаление
+                                prev.OpCode = OpCodes.Nop;
+                                prev.Operand = null;
+                                instr.OpCode = OpCodes.Nop;
+                                instr.Operand = null;
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    }
+                    // --- Шаг Б: Упрощение условий ---
+                    // Если видим проверку переменной состояния: ldloc + ldc + ceq + br...
+                    // Мы можем вычислить результат прямо сейчас.
+                    if (instr.OpCode.FlowControl == FlowControl.Cond_Branch)
+                    {
+                        // Пытаемся найти паттерн сравнения перед этим ветвлением
+                        bool? result = TryEvaluateCondition(instructions, i, stateVarIndex, currentState);
+                        
+                        if (result.HasValue)
+                        {
+                            if (result.Value)
+                            {
+                                // Условие истинно: заменяем на безусловный переход
+                                instr.OpCode = OpCodes.Br;
+                                changed = true;
+                            }
+                            else
+                            {
+                                // Условие ложно: удаляем переход (превращаем в nop)
+                                instr.OpCode = OpCodes.Nop;
+                                instr.Operand = null;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if (changed)
+                {
+                    body.UpdateInstructionOffsets();
+                }
+            }
+            // Финальная очистка: убираем все NOP и пересчитываем оффсеты
+            CleanupMethod(method);
+            
+            // Удаляем саму переменную состояния, если она больше не используется
+            RemoveStateVariable(method, stateVarIndex);
+        }
+        /// <summary>
+        /// Пытается вычислить результат условия, анализируя стек и переменные.
+        /// </summary>
+        private bool? TryEvaluateCondition(IList<Instruction> instructions, int branchIndex, int stateVarIndex, object? currentState)
+        {
+            // Идем назад от ветвления, чтобы найти сравнение
+            // Ожидаемый паттерн: ... ldc.X, ldloc.s state, ceq, brtrue/brfalse ...
+            // Или: ldloc, ldc, cgt, br...
+            
+            int idx = branchIndex - 1;
+            Instruction? cmpInstr = null;
+            Instruction? constInstr = null;
+            // Ищем операцию сравнения (ceq, cgt, clt)
+            while (idx >= 0)
+            {
+                var curr = instructions[idx];
+                if (curr.OpCode.Code == Code.Nop) { idx--; continue; }
+                if (curr.OpCode.Code == Code.Ceq || curr.OpCode.Code == Code.Cgt || curr.OpCode.Code == Code.Clt ||
+                    curr.OpCode.Code == Code.Cgt_Un || curr.OpCode.Code == Code.Clt_Un)
+                {
+                    cmpInstr = curr;
+                    break;
+                }
+                // Если встретили другое ветвление или возврат, останавливаемся
+                if (curr.OpCode.FlowControl == FlowControl.Cond_Branch || 
+                    curr.OpCode.Code == Code.Ret || curr.OpCode.Code == Code.Throw)
+                    break;
+                idx--;
+            }
+            if (cmpInstr == null) return null;
+            // Теперь ищем константу и загрузку переменной перед сравнением
+            // Стек перед cmp: [Value1, Value2]. Один из них - наша переменная состояния.
+            int searchIdx = cmpInstr.Index - 1;
+            bool foundStateLoad = false;
+            object? foundConst = null;
+            // Проходим пару инструкций назад
+            int count = 0;
+            while (searchIdx >= 0 && count < 6)
+            {
+                var curr = instructions[searchIdx];
+                if (curr.OpCode.Code == Code.Nop) { searchIdx--; continue; }
+                if (IsLdloc(curr, out int lIdx) && lIdx == stateVarIndex)
+                {
+                    foundStateLoad = true;
+                }
+                else if (!foundStateLoad) // Ищем константу, если еще не нашли загрузку состояния (она может быть ниже в стеке или выше)
+                {
+                    var val = GetConstantValue(curr);
+                    if (val != null)
+                    {
+                        foundConst = val;
+                    }
+                }
+                
+                // Если нашли и то и другое
+                if (foundStateLoad && foundConst != null) break;
+                searchIdx--;
+                count++;
+            }
+            // Если мы знаем currentState, и нашли константу для сравнения
+            if (foundStateLoad && foundConst != null && currentState != null)
+            {
+                return CompareValues(currentState, foundConst, cmpInstr.OpCode.Code);
+            }
+            
+            // Особый случай: проверка на истинность (brtrue) без явного сравнения с константой
+            // Например, если в стеке просто результат предыдущего вычисления.
+            // Но в данном типе обфускации почти всегда есть явное сравнение num == X.
+            
+            return null;
+        }
         /// <summary>
         /// Удаляет переменную состояния и связанные с ней инструкции после распутывания.
         /// </summary>
