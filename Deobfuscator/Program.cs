@@ -28,27 +28,17 @@ namespace Deobfuscator
             }
 
             // Парсинг аргументов вручную для совместимости
-            var aiConfig = new AiConfig();
-            
-            for (int i = 2; i < args.Length; i++)
-            {
-                switch (args[i])
-                {
-                    case "--ai":
-                        aiConfig.Enabled = true;
-                        break;
-                    case "--ai-url":
-                        if (i + 1 < args.Length) aiConfig.ApiUrl = args[++i];
-                        break;
-                    case "--ai-model":
-                        if (i + 1 < args.Length) aiConfig.Model = args[++i];
-                        break;
-                    case "--ai-timeout":
-                        if (i + 1 < args.Length && int.TryParse(args[++i], out int t))
-                            aiConfig.TimeoutSeconds = t;
-                        break;
-                }
-            }
+// Пример использования в Program.cs
+var aiConfig = new AiConfig 
+{ 
+    Enabled = true, 
+    Endpoint = "http://192.168.31.130:11434/api/generate", // Ваш адрес
+    Model = "codellama" 
+};
+
+using var deob = new UniversalDeobfuscator(args[0], aiConfig);
+deob.Deobfuscate();
+deob.Save(args[0] + ".deob.exe");
 
             try
             {
