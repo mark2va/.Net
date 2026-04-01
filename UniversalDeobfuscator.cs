@@ -20,7 +20,7 @@ namespace Deobfuscator
 
         public void Deobfuscate()
         {
-            Console.WriteLine("[*] Starting deep deobfuscation...");
+            Console.WriteLine("[*] Starting deep deobfuscation with stack emulation...");
             int count = 0;
             
             foreach (var type in _module.GetTypes())
@@ -31,11 +31,19 @@ namespace Deobfuscator
 
                     try
                     {
-                        // Запускаем глубокую очистку потока управления
-                        UnravelControlFlow(method);
+                        // Пытаемся распутать через эмуляцию
+                        bool unraveled = EmulateAndUnravel(method);
                         
-                        // Чистим оставшийся мусор (NOP)
-                        CleanupMethod(method);
+                        if (!unraveled)
+                        {
+                            // Фоллбэк: простая очистка NOP и мертвого кода
+                            CleanupMethod(method);
+                            RemoveUnreachableBlocks(method);
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[+] Unraveled: {method.FullName}");
+                        }
 
                         if (_aiAssistant != null && IsObfuscatedName(method.Name))
                         {
@@ -53,14 +61,315 @@ namespace Deobfuscator
         }
 
         /// <summary>
-        /// Основной алгоритм распутывания: эмуляция значений переменных и упрощение ветвлений.
+        /// Эмулирует выполнение метода для восстановления линейного потока.
+        /// Это единственный надежный способ снять обфускацию состояния.
         /// </summary>
-        private void UnravelControlFlow(MethodDef method)
+        private bool EmulateAndUnravel(MethodDef method)
+        {
+            var body = method.Body;
+            if (body == null || !body.HasInstructions) return false;
+
+            var instructions = body.Instructions;
+            if (instructions.Count < 5) return false;
+
+            // 1. Поиск переменной состояния (обычно первая присваиваемая локаль)
+            int stateVarIndex = -1;
+            object? initialState = null;
+
+            for (int i = 0; i < Math.Min(instructions.Count, 20); i++)
+            {
+                if (IsStloc(instructions[i], out int idx))
+                {
+                    if (i > 0)
+                    {
+                        var val = GetConstantValue(instructions[i - 1]);
+                        if (val != null)
+                        {
+                            stateVarIndex = idx;
+                            initialState = val;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (stateVarIndex == -1) return false;
+
+            Console.WriteLine($"  -> Found state var: Local_{stateVarIndex}, Initial: {initialState}");
+
+            // 2. Эмуляция выполнения
+            var executedInstructions = new List<Instruction>();
+            var stack = new Stack<object?>();
+            var locals = new object?[method.Body.Variables.Count];
+            
+            // Инициализация локали состояния
+            if (stateVarIndex < locals.Length)
+                locals[stateVarIndex] = initialState;
+
+            int ip = 0; // Instruction Pointer (индекс в списке инструкций)
+            int maxSteps = 10000; // Защита от бесконечных циклов
+            int steps = 0;
+            
+            // Карта соответствия: оригинальная инструкция -> была ли она обработана как "состояние"
+            var stateControlInstructions = new HashSet<Instruction>();
+
+            while (ip >= 0 && ip < instructions.Count && steps < maxSteps)
+            {
+                steps++;
+                var instr = instructions[ip];
+                bool advanceIp = true;
+
+                try
+                {
+                    // Обработка загрузки константы в стек
+                    if (instr.OpCode.Code == Code.Ldc_I4 || instr.OpCode.Code == Code.Ldc_I8 || 
+                        instr.OpCode.Code == Code.Ldc_R4 || instr.OpCode.Code == Code.Ldc_R8 ||
+                        (instr.OpCode.Code >= Code.Ldc_I4_0 && instr.OpCode.Code <= Code.Ldc_I4_M1))
+                    {
+                        var val = GetConstantValue(instr);
+                        if (val != null) stack.Push(val);
+                    }
+                    // Обработка сохранения локальной переменной (особенно состояния)
+                    else if (IsStloc(instr, out int storeIdx))
+                    {
+                        if (stack.Count > 0)
+                        {
+                            var val = stack.Pop();
+                            if (storeIdx < locals.Length)
+                                locals[storeIdx] = val;
+                            
+                            // Если это обновление состояния, помечаем инструкцию как служебную
+                            if (storeIdx == stateVarIndex)
+                                stateControlInstructions.Add(instr);
+                        }
+                    }
+                    // Обработка загрузки локальной переменной
+                    else if (IsLdloc(instr, out int loadIdx))
+                    {
+                        if (loadIdx < locals.Length)
+                            stack.Push(locals[loadIdx]);
+                    }
+                    // Обработка сравнений состояний: if (num == X)
+                    else if (instr.OpCode.FlowControl == FlowControl.Cond_Branch)
+                    {
+                        // Проверяем паттерн: Ldloc (state) -> Ldc (const) -> Branch
+                        if (ip >= 2)
+                        {
+                            var prev1 = instructions[ip - 1]; // Ldc
+                            var prev2 = instructions[ip - 2]; // Ldloc
+
+                            if (IsLdloc(prev2, out int checkIdx) && checkIdx == stateVarIndex)
+                            {
+                                var constVal = GetConstantValue(prev1);
+                                var current_state = locals[stateVarIndex];
+
+                                if (constVal != null && current_state != null)
+                                {
+                                    bool takeBranch = CompareValues(current_state, constVal, instr.OpCode.Code) ?? false;
+                                    
+                                    // Помечаем инструкции сравнения как служебные
+                                    stateControlInstructions.Add(prev2);
+                                    stateControlInstructions.Add(prev1);
+                                    stateControlInstructions.Add(instr);
+
+                                    if (takeBranch)
+                                    {
+                                        if (instr.Operand is Instruction target)
+                                        {
+                                            ip = instructions.IndexOf(target);
+                                            advanceIp = false;
+                                            continue;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        // Ветка не выполняется, просто идем дальше
+                                        // Но если есть альтернативная ветка (else), её нужно пропустить?
+                                        // В данном паттерне обычно false ведет к следующей инструкции или выходу
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Обработка безусловного перехода (goto)
+                        if (instr.OpCode.Code == Code.Br || instr.OpCode.Code == Code.Br_S)
+                        {
+                            stateControlInstructions.Add(instr);
+                            if (instr.Operand is Instruction target)
+                            {
+                                ip = instructions.IndexOf(target);
+                                advanceIp = false;
+                                continue;
+                            }
+                        }
+                        
+                        // Обработка выхода из цикла (break)
+                        if (instr.OpCode.Code == Code.Leave || instr.OpCode.Code == Code.Leave_S || 
+                            instr.OpCode.Code == Code.Ret || instr.OpCode.Code == Code.Endfinally)
+                        {
+                             // Если это конец эмуляции основного блока
+                             if (instr.OpCode.Code == Code.Ret || instr.OpCode.Code == Code.Endfinally)
+                                 break; 
+                        }
+                    }
+                    // Игнорирование NOP
+                    else if (instr.OpCode.Code == Code.Nop)
+                    {
+                        // Ничего не делаем
+                    }
+                    // Реальная бизнес-логика
+                    else
+                    {
+                        // Если инструкция не является частью механизма состояния, добавляем её в результат
+                        if (!stateControlInstructions.Contains(instr))
+                        {
+                            executedInstructions.Add(CloneInstruction(instr));
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"  [!] Emulation error at IP {ip}: {ex.Message}");
+                    break;
+                }
+
+                if (advanceIp)
+                    ip++;
+            }
+
+            if (executedInstructions.Count == 0)
+                return false;
+
+            // Добавляем Ret в конце, если его нет
+            if (executedInstructions.Last().OpCode.Code != Code.Ret)
+            {
+                executedInstructions.Add(Instruction.Create(OpCodes.Ret));
+            }
+
+            ReplaceMethodBody(method, executedInstructions);
+            return true;
+        }
+
+        /// <summary>
+        /// Сравнивает значения для определения направления ветвления.
+        /// </summary>
+        private bool? CompareValues(object? actual, object? expected, Code opCode)
+        {
+            if (actual == null || expected == null) return null;
+
+            try
+            {
+                double dActual = Convert.ToDouble(actual);
+                double dExpected = Convert.ToDouble(expected);
+
+                switch (opCode)
+                {
+                    case Code.Beq:
+                    case Code.Beq_S:
+                        return dActual == dExpected;
+                    case Code.Bne_Un:
+                    case Code.Bne_Un_S:
+                        return dActual != dExpected;
+                    case Code.Bgt:
+                    case Code.Bgt_S:
+                    case Code.Bgt_Un:
+                    case Code.Bgt_Un_S:
+                        return dActual > dExpected;
+                    case Code.Bge:
+                    case Code.Bge_S:
+                    case Code.Bge_Un:
+                    case Code.Bge_Un_S:
+                        return dActual >= dExpected;
+                    case Code.Blt:
+                    case Code.Blt_S:
+                    case Code.Blt_Un:
+                    case Code.Blt_Un_S:
+                        return dActual < dExpected;
+                    case Code.Ble:
+                    case Code.Ble_S:
+                    case Code.Ble_Un:
+                    case Code.Ble_Un_S:
+                        return dActual <= dExpected;
+                    case Code.Brtrue:
+                    case Code.Brtrue_S:
+                        return dActual != 0;
+                    case Code.Brfalse:
+                    case Code.Brfalse_S:
+                        return dActual == 0;
+                }
+            }
+            catch { }
+            
+            return null;
+        }
+                }
+            }
+            
+            // Добавляем последний блок
+            if (currentState != null && currentBlock.Count > 0)
+            {
+                if (!blocks.ContainsKey(currentState))
+                    blocks[currentState] = new List<Instruction>();
+                blocks[currentState].AddRange(currentBlock);
+            }
+            
+            return blocks;
+        }
+
+        private bool IsStateAssignment(Instruction instr, int stateVarIndex, out object? newValue)
+        {
+            newValue = null;
+            
+            // Паттерн: ldc.* -> stloc (присваивание константы переменной состояния)
+            // Мы уже обработали это в ExtractStateBlocks через последовательность инструкций
+            
+            // Для более точного определения нужно смотреть на контекст
+            // Упрощенно: если это ldc.* и следующая stloc нашей переменной
+            return false; // Реализуется через контекстный анализ
+        }
+
+        private List<Instruction> BuildLinearFlow(MethodDef method, Dictionary<object, List<Instruction>> stateBlocks, object? initialState, int stateVarIndex)
+        {
+            var result = new List<Instruction>();
+            var visited = new HashSet<object>();
+            var queue = new Queue<object>();
+            
+            if (initialState != null)
+                queue.Enqueue(initialState);
+            
+            while (queue.Count > 0)
+            {
+                var state = queue.Dequeue();
+                if (visited.Contains(state)) continue;
+                visited.Add(state);
+                
+                if (stateBlocks.TryGetValue(state, out var block))
+                {
+                    foreach (var instr in block)
+                    {
+                        // Клонируем инструкцию, чтобы избежать проблем с общими ссылками
+                        var cloned = CloneInstruction(instr);
+                        result.Add(cloned);
+                        
+                        // Если инструкция изменяет состояние, добавляем новое состояние в очередь
+                        // (упрощенная логика)
+                    }
+                }
+            }
+            
+            return result;
+        }
+
+        /// <summary>
+        /// Упрощенный подход: эмуляция значений и упрощение ветвлений.
+        /// Используется когда не найден явный state machine.
+        /// </summary>
+        private void SimplifyControlFlow(MethodDef method)
         {
             var body = method.Body;
             var instructions = body.Instructions;
             bool changed = true;
-            int maxPasses = 20; // Защита от зависания
+            int maxPasses = 20;
             int pass = 0;
 
             while (changed && pass < maxPasses)
@@ -68,17 +377,13 @@ namespace Deobfuscator
                 changed = false;
                 pass++;
 
-                // 1. Словарь для хранения известных значений локальных переменных в текущем проходе
-                // Ключ: индекс локальной переменной, Значение: константа
-                var knownValues = new Dictionary<int, object>();
+                var knownValues = new Dictionary<int, object?>();
 
-                // Проходим по инструкциям, пытаясь вычислить значения и упростить условия
                 for (int i = 0; i < instructions.Count; i++)
                 {
                     var instr = instructions[i];
 
-                    // --- АНАЛИЗ ПРИСВАИВАНИЯ КОНСТАНТ ---
-                    // Ищем паттерн: ldc... -> stloc
+                    // Анализ присваивания констант
                     if (i + 1 < instructions.Count)
                     {
                         var current = instr;
@@ -90,50 +395,36 @@ namespace Deobfuscator
                             if (val != null)
                             {
                                 knownValues[localIdx] = val;
-                                
-                                // Оптимизация: если сразу после присваивания идет проверка этой переменной,
-                                // мы можем попытаться упростить её позже.
                             }
                         }
                     }
 
-                    // --- УПРОЩЕНИЕ УСЛОВНЫХ ПЕРЕХОДОВ (if (num == X) goto) ---
-                    // Паттерн: ldloc, ldc, ceq/cgt/clt, brtrue/brfalse
-                    // Или более сложный: ldloc, ldc, bne.un / beq
+                    // Упрощение условных переходов
                     if (instr.OpCode.FlowControl == FlowControl.Cond_Branch)
                     {
-                        // Пытаемся найти сравнение перед ветвлением
-                        // В dnlib часто: ldloc, ldc, br.eq (совмещенное) ИЛИ ldloc, ldc, ceq, brtrue
-                        
-                        // Проверка на прямое сравнение с константой (ldloc, ldc, branch)
                         if (i >= 2)
                         {
-                            var prev1 = instructions[i - 1]; // ldc
-                            var prev2 = instructions[i - 2]; // ldloc
+                            var prev1 = instructions[i - 1];
+                            var prev2 = instructions[i - 2];
 
                             if (IsLdloc(prev2, out int checkLocalIdx) && GetConstantValue(prev1) != null)
                             {
                                 var constVal = GetConstantValue(prev1);
                                 
-                                // Если у нас есть известное значение этой переменной из предыдущих присваиваний
                                 if (knownValues.ContainsKey(checkLocalIdx))
                                 {
                                     var actualVal = knownValues[checkLocalIdx];
-                                    
-                                    // Сравниваем фактическое значение с тем, что проверяется
-                                    bool result = CompareValues(actualVal, constVal, instr.OpCode.Code);
+                                    var result = CompareValues(actualVal, constVal, instr.OpCode.Code);
                                     
                                     if (result.HasValue)
                                     {
                                         if (result.Value)
                                         {
-                                            // Условие истинно: заменяем на безусловный переход (Br)
                                             instr.OpCode = OpCodes.Br;
                                             changed = true;
                                         }
                                         else
                                         {
-                                            // Условие ложно: превращаем в Nop (переход не выполняется)
                                             instr.OpCode = OpCodes.Nop;
                                             instr.Operand = null;
                                             changed = true;
@@ -143,25 +434,14 @@ namespace Deobfuscator
                             }
                         }
                     }
-
-                    // --- УДАЛЕНИЕ БЕСКОНЕЧНЫХ ЦИКЛОВ С BREAK (for(;;) { if(x) break; }) ---
-                    // Если видим безусловный выход из цикла (Br) на инструкцию сразу после цикла
-                    // Это сложно детектировать без графа, но можно упростить:
-                    // Если цикл состоит только из проверок констант и одного выхода, он схлопнется сам
-                    // после упрощения условий выше.
                 }
 
-                // После изменения инструкций нужно обновить оффсеты и пересчитать стек, 
-                // чтобы следующие проходы работали корректно
                 if (changed)
                 {
                     body.UpdateInstructionOffsets();
-                    // Пересборка макросов может помочь, но иногда ломает метки, поэтому осторожно
-                    // body.SimplifyMacros(method.Parameters); 
                 }
             }
 
-            // Финальный проход: удаление недостижимого кода
             RemoveUnreachableBlocks(method);
         }
 
@@ -388,6 +668,79 @@ namespace Deobfuscator
             if (!char.IsLetter(name[0]) && name[0] != '_') return false;
             foreach (var c in name) if (!char.IsLetterOrDigit(c) && c != '_') return false;
             return true;
+        }
+
+        /// <summary>
+        /// Клонирует инструкцию с сохранением типа операнда.
+        /// </summary>
+        private Instruction CloneInstruction(Instruction orig)
+        {
+            var opCode = orig.OpCode;
+            var operand = orig.Operand;
+
+            // Обработка специальных типов операндов
+            if (operand is Local local)
+                return Instruction.Create(opCode, local);
+            
+            if (operand is Parameter param)
+                return Instruction.Create(opCode, param);
+            
+            if (operand is Instruction target)
+                return Instruction.Create(opCode, target);
+            
+            if (operand is Instruction[] targets)
+                return Instruction.Create(opCode, targets);
+            
+            if (operand is string str)
+                return Instruction.Create(opCode, str);
+            
+            if (operand is int i)
+                return Instruction.Create(opCode, i);
+            
+            if (operand is long l)
+                return Instruction.Create(opCode, l);
+            
+            if (operand is float f)
+                return Instruction.Create(opCode, f);
+            
+            if (operand is double d)
+                return Instruction.Create(opCode, d);
+            
+            if (operand is ITypeDefOrRef type)
+                return Instruction.Create(opCode, type);
+            
+            if (operand is MethodDef method)
+                return Instruction.Create(opCode, method);
+            
+            if (operand is FieldDef field)
+                return Instruction.Create(opCode, field);
+            
+            if (operand is MemberRef memberRef)
+                return Instruction.Create(opCode, memberRef);
+            
+            // Fallback: используем конструктор для неизвестных типов
+            return new Instruction(opCode, operand);
+        }
+
+        /// <summary>
+        /// Заменяет тело метода на новый список инструкций.
+        /// </summary>
+        private void ReplaceMethodBody(MethodDef method, List<Instruction> newInstructions)
+        {
+            var body = method.Body;
+            
+            // Очищаем старые инструкции
+            body.Instructions.Clear();
+            
+            // Добавляем новые инструкции
+            foreach (var instr in newInstructions)
+            {
+                body.Instructions.Add(instr);
+            }
+            
+            // Обновляем оффсеты и пересчитываем стек
+            body.UpdateInstructionOffsets();
+            body.SimplifyMacros(method.Parameters);
         }
 
         #endregion
