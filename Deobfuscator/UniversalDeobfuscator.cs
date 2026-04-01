@@ -621,14 +621,26 @@ namespace Deobfuscator
             if (orig.Operand is IField fieldRef)
                 return Instruction.Create(orig.OpCode, fieldRef);
             
-            if (orig.Operand is IType typeRef)
+            if (orig.Operand is ITypeDefOrRef typeRef)
                 return Instruction.Create(orig.OpCode, typeRef);
             
-            if (orig.Operand is Token token)
-                return Instruction.Create(orig.OpCode, token);
+            if (orig.Operand is Parameter param)
+                return Instruction.Create(orig.OpCode, param);
             
-            // Fallback: пытаемся использовать operand как есть
-            return Instruction.Create(orig.OpCode, orig.Operand);
+            if (orig.Operand is Local local)
+                return Instruction.Create(orig.OpCode, local);
+            
+            if (orig.Operand is Instruction instr)
+                return Instruction.Create(orig.OpCode, instr);
+            
+            if (orig.Operand is Instruction[] instrs)
+                return Instruction.Create(orig.OpCode, instrs);
+            
+            if (orig.Operand is Variable var)
+                return Instruction.Create(orig.OpCode, var);
+            
+            // Fallback: создаем инструкцию с оригинальным операндом через конструктор
+            return new Instruction(orig.OpCode, orig.Operand);
         }
 
         private void ReplaceMethodBody(MethodDef method, List<Instruction> newInstructions)
