@@ -624,20 +624,17 @@ namespace Deobfuscator
             if (orig.Operand is ITypeDefOrRef typeRef)
                 return Instruction.Create(orig.OpCode, typeRef);
             
-            if (orig.Operand is Parameter param)
-                return Instruction.Create(orig.OpCode, param);
+            if (orig.Operand is Parameter parameter)
+                return Instruction.Create(orig.OpCode, parameter);
             
-            if (orig.Operand is Local local)
-                return Instruction.Create(orig.OpCode, local);
+            if (orig.Operand is Local localVar)
+                return Instruction.Create(orig.OpCode, localVar);
             
             if (orig.Operand is Instruction instr)
                 return Instruction.Create(orig.OpCode, instr);
             
             if (orig.Operand is Instruction[] instrs)
                 return Instruction.Create(orig.OpCode, instrs);
-            
-            if (orig.Operand is Variable var)
-                return Instruction.Create(orig.OpCode, var);
             
             // Fallback: создаем инструкцию с оригинальным операндом через конструктор
             return new Instruction(orig.OpCode, orig.Operand);
