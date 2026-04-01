@@ -119,6 +119,18 @@ namespace Deobfuscator
                             Log($"Removed {nopCount} NOP instructions");
                         }
                         
+                        // Исправляем стек (менее агрессивно)
+                        if (method.Body.Instructions.Count > 0)
+                        {
+                            int beforeFix = method.Body.Instructions.Count;
+                            FixStackImbalance(method);
+                            if (beforeFix != method.Body.Instructions.Count)
+                            {
+                                wasModified = true;
+                                Log($"Fixed stack imbalance. Instructions: {beforeFix} -> {method.Body.Instructions.Count}");
+                            }
+                        }
+                        
                         // Проверяем, не стал ли метод пустым
                         if (method.Body.Instructions.Count == 0)
                         {
@@ -553,16 +565,55 @@ namespace Deobfuscator
             }
         }
 
-        private void RestoreMethod(MethodDef method, List<Instruction> backupInstructions)
+        private void RemoveUnreachableBlocks(MethodDef method)
         {
             var body = method.Body;
-            body.Instructions.Clear();
-            foreach (var instr in backupInstructions)
+            var instrs = body.Instructions;
+            if (instrs.Count == 0) return;
+
+            var reachable = new HashSet<Instruction>();
+            var q = new Queue<Instruction>();
+            
+            q.Enqueue(instrs[0]);
+            reachable.Add(instrs[0]);
+
+            while (q.Count > 0)
             {
-                body.Instructions.Add(CloneInstruction(instr));
+                var curr = q.Dequeue();
+                int idx = instrs.IndexOf(curr);
+                if (idx == -1) continue;
+
+                if (curr.OpCode.Code != Code.Br && curr.OpCode.Code != Code.Br_S && 
+                    curr.OpCode.Code != Code.Ret && curr.OpCode.Code != Code.Throw)
+                {
+                    if (idx + 1 < instrs.Count)
+                    {
+                        var next = instrs[idx + 1];
+                        if (reachable.Add(next)) q.Enqueue(next);
+                    }
+                }
+
+                if (curr.Operand is Instruction t)
+                {
+                    if (reachable.Add(t)) q.Enqueue(t);
+                }
+                else if (curr.Operand is Instruction[] ts)
+                {
+                    foreach (var x in ts) if (reachable.Add(x)) q.Enqueue(x);
+                }
             }
-            body.UpdateInstructionOffsets();
-            body.SimplifyMacros(method.Parameters);
+
+            bool changed = false;
+            for (int i = instrs.Count - 1; i >= 0; i--)
+            {
+                if (!reachable.Contains(instrs[i]))
+                {
+                    instrs[i].OpCode = OpCodes.Nop;
+                    instrs[i].Operand = null;
+                    changed = true;
+                }
+            }
+            if (changed) body.UpdateInstructionOffsets();
         }
 
         private List<Instruction> ExtractBlock(IList<Instruction> allInstructions, Instruction startInstr, int stateVarIndex, out object? nextState)
@@ -642,19 +693,181 @@ namespace Deobfuscator
             return block;
         }
 
-        // Остальные вспомогательные методы остаются без изменений
-        private bool IsStloc(Instruction i, out int idx) { /* ... */ }
-        private bool IsLdloc(Instruction i, out int idx) { /* ... */ }
-        private int GetLocalIndex(Instruction i) { /* ... */ }
-        private object? GetConstantValue(Instruction i) { /* ... */ }
-        private bool IsObfuscatedName(string n) { /* ... */ }
-        private void RenameWithAi(MethodDef m) { /* ... */ }
-        private bool IsValidIdentifier(string n) { /* ... */ }
-        private Instruction CloneInstruction(Instruction orig) { /* ... */ }
-        private void ReplaceMethodBody(MethodDef m, List<Instruction> newInstrs) { /* ... */ }
-        private void RemoveUnreachableBlocks(MethodDef method) { /* ... */ }
-        private bool? TryEvalSimpleCondition(IList<Instruction> instrs, int idx, Dictionary<int, object?> known) { /* ... */ }
-        private bool? CompareValues(object? a, object? b, Code op) { /* ... */ }
+        private void RestoreMethod(MethodDef method, List<Instruction> backupInstructions)
+        {
+            var body = method.Body;
+            body.Instructions.Clear();
+            foreach (var instr in backupInstructions)
+            {
+                body.Instructions.Add(CloneInstruction(instr));
+            }
+            body.UpdateInstructionOffsets();
+            body.SimplifyMacros(method.Parameters);
+        }
+
+        private bool? TryEvalSimpleCondition(IList<Instruction> instrs, int idx, Dictionary<int, object?> known)
+        {
+            if (idx < 2) return null;
+            var branch = instrs[idx];
+            var prev1 = instrs[idx - 1]; 
+            var prev2 = instrs[idx - 2]; 
+            var prev3 = (idx >= 3) ? instrs[idx - 3] : null; 
+
+            if ((prev1.OpCode.Code == Code.Ceq || prev1.OpCode.Code == Code.Cgt || prev1.OpCode.Code == Code.Clt))
+            {
+                if (prev3 != null && IsLdloc(prev3, out int lIdx) && GetConstantValue(prev2) is object val2)
+                {
+                    if (known.ContainsKey(lIdx))
+                    {
+                        return CompareValues(known[lIdx], val2, prev1.OpCode.Code);
+                    }
+                }
+            }
+            
+            if (branch.OpCode.Code == Code.Brtrue || branch.OpCode.Code == Code.Brfalse || 
+                branch.OpCode.Code == Code.Brtrue_S || branch.OpCode.Code == Code.Brfalse_S)
+            {
+                if (prev2 != null && IsLdloc(prev2, out int lIdx) && known.ContainsKey(lIdx))
+                {
+                    var val = known[lIdx];
+                    if (val == null) return null;
+                    bool isZero = Convert.ToDouble(val) == 0;
+                    return (branch.OpCode.Code == Code.Brtrue || branch.OpCode.Code == Code.Brtrue_S) ? !isZero : isZero;
+                }
+            }
+
+            return null;
+        }
+
+        private bool? CompareValues(object? a, object? b, Code op)
+        {
+            if (a == null || b == null) return null;
+            try
+            {
+                double da = Convert.ToDouble(a);
+                double db = Convert.ToDouble(b);
+                switch (op)
+                {
+                    case Code.Ceq: return da == db;
+                    case Code.Cgt: case Code.Cgt_Un: return da > db;
+                    case Code.Clt: case Code.Clt_Un: return da < db;
+                }
+            } catch { }
+            return null;
+        }
+
+        #region Helpers
+
+        private bool IsStloc(Instruction i, out int idx)
+        {
+            idx = -1;
+            if (i.Operand is Local l) idx = l.Index;
+            else if (i.OpCode.Code == Code.Stloc_0) idx = 0;
+            else if (i.OpCode.Code == Code.Stloc_1) idx = 1;
+            else if (i.OpCode.Code == Code.Stloc_2) idx = 2;
+            else if (i.OpCode.Code == Code.Stloc_3) idx = 3;
+            return idx != -1 && (i.OpCode.Code == Code.Stloc || i.OpCode.Code == Code.Stloc_S || 
+                   i.OpCode.Code >= Code.Stloc_0 && i.OpCode.Code <= Code.Stloc_3);
+        }
+
+        private bool IsLdloc(Instruction i, out int idx)
+        {
+            idx = -1;
+            if (i.Operand is Local l) idx = l.Index;
+            else if (i.OpCode.Code == Code.Ldloc_0) idx = 0;
+            else if (i.OpCode.Code == Code.Ldloc_1) idx = 1;
+            else if (i.OpCode.Code == Code.Ldloc_2) idx = 2;
+            else if (i.OpCode.Code == Code.Ldloc_3) idx = 3;
+            return idx != -1 && (i.OpCode.Code == Code.Ldloc || i.OpCode.Code == Code.Ldloc_S || 
+                   i.OpCode.Code >= Code.Ldloc_0 && i.OpCode.Code <= Code.Ldloc_3);
+        }
+
+        private int GetLocalIndex(Instruction i)
+        {
+            if (IsLdloc(i, out int idx) || IsStloc(i, out idx)) return idx;
+            return -1;
+        }
+
+        private object? GetConstantValue(Instruction i)
+        {
+            switch (i.OpCode.Code)
+            {
+                case Code.Ldc_I4: return i.Operand as int?;
+                case Code.Ldc_I4_0: return 0;
+                case Code.Ldc_I4_1: return 1;
+                case Code.Ldc_I4_2: return 2;
+                case Code.Ldc_I4_3: return 3;
+                case Code.Ldc_I4_4: return 4;
+                case Code.Ldc_I4_5: return 5;
+                case Code.Ldc_I4_6: return 6;
+                case Code.Ldc_I4_7: return 7;
+                case Code.Ldc_I4_8: return 8;
+                case Code.Ldc_I4_M1: return -1;
+                case Code.Ldc_I8: return i.Operand as long?;
+                case Code.Ldc_R4: return i.Operand as float?;
+                case Code.Ldc_R8: return i.Operand as double?;
+                case Code.Ldstr: return i.Operand as string;
+                case Code.Ldnull: return null;
+                default: return null;
+            }
+        }
+
+        private bool IsObfuscatedName(string n) => !string.IsNullOrEmpty(n) && (n.Length == 1 || n.StartsWith("?"));
+
+        private void RenameWithAi(MethodDef m)
+        {
+            if (_aiAssistant == null) return;
+            try
+            {
+                var snip = string.Join("\n", m.Body.Instructions.Take(15).Select(x => x.ToString()));
+                var newName = _aiAssistant.GetSuggestedName(m.Name, snip, m.ReturnType?.ToString());
+                if (!string.IsNullOrEmpty(newName) && IsValidIdentifier(newName))
+                {
+                    m.Name = newName;
+                    Console.WriteLine($"[AI] Renamed {m.Name}");
+                    Log($"[AI] Renamed {m.Name}");
+                }
+            } catch { }
+        }
+
+        private bool IsValidIdentifier(string n)
+        {
+            if (string.IsNullOrEmpty(n)) return false;
+            if (!char.IsLetter(n[0]) && n[0] != '_') return false;
+            foreach (var c in n) if (!char.IsLetterOrDigit(c) && c != '_') return false;
+            return true;
+        }
+
+        private Instruction CloneInstruction(Instruction orig)
+        {
+            var op = orig.OpCode;
+            var operand = orig.Operand;
+            if (operand is Local l) return Instruction.Create(op, l);
+            if (operand is Parameter p) return Instruction.Create(op, p);
+            if (operand is Instruction t) return Instruction.Create(op, t);
+            if (operand is Instruction[] ts) return Instruction.Create(op, ts);
+            if (operand is string s) return Instruction.Create(op, s);
+            if (operand is int i) return Instruction.Create(op, i);
+            if (operand is long lo) return Instruction.Create(op, lo);
+            if (operand is float f) return Instruction.Create(op, f);
+            if (operand is double d) return Instruction.Create(op, d);
+            if (operand is ITypeDefOrRef td) return Instruction.Create(op, td);
+            if (operand is MethodDef m) return Instruction.Create(op, m);
+            if (operand is FieldDef fd) return Instruction.Create(op, fd);
+            if (operand is MemberRef mr) return Instruction.Create(op, mr);
+            return new Instruction(op, operand);
+        }
+
+        private void ReplaceMethodBody(MethodDef m, List<Instruction> newInstrs)
+        {
+            var body = m.Body;
+            body.Instructions.Clear();
+            foreach (var i in newInstrs) body.Instructions.Add(i);
+            body.UpdateInstructionOffsets();
+            body.SimplifyMacros(m.Parameters);
+        }
+
+        #endregion
 
         public void Save(string path)
         {
