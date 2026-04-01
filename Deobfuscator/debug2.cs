@@ -72,7 +72,6 @@ namespace Deobfuscator
                     Log($"Processing method: {method.FullName}");
                     _indentLevel++;
                     
-                    // Сохраняем полный бэкап метода
                     var backupInstructions = method.Body.Instructions.ToList();
                     int originalCount = backupInstructions.Count;
                     Log($"Original instructions: {originalCount}");
@@ -81,10 +80,22 @@ namespace Deobfuscator
                     {
                         bool wasModified = false;
                         
-                        // Проверяем, является ли метод state machine (только если есть подозрения)
-                        if (originalCount > 10 && LooksLikeStateMachine(method))
+                        // Показываем первые инструкции для анализа
+                        if (_debugMode && originalCount > 0)
                         {
-                            Log("Method looks like state machine, attempting to unpack...");
+                            Log("First 10 instructions:");
+                            _indentLevel++;
+                            for (int i = 0; i < Math.Min(10, originalCount); i++)
+                            {
+                                Log(backupInstructions[i].ToString());
+                            }
+                            _indentLevel--;
+                        }
+                        
+                        // Только если метод действительно выглядит как state machine
+                        if (originalCount > 10 && IsDefinitelyStateMachine(method))
+                        {
+                            Log("Method is definitely a state machine, attempting to unpack...");
                             bool unpacked = UnpackStateMachineSafe(method);
                             if (unpacked)
                             {
@@ -97,38 +108,9 @@ namespace Deobfuscator
                                 RestoreMethod(method, backupInstructions);
                             }
                         }
-                        
-                        // Упрощаем условия только если метод не стал пустым
-                        if (method.Body.Instructions.Count > 0)
+                        else
                         {
-                            int beforeSimplify = method.Body.Instructions.Count;
-                            SimplifyConditionsSafe(method);
-                            if (beforeSimplify != method.Body.Instructions.Count)
-                            {
-                                wasModified = true;
-                                Log($"Simplified conditions. Instructions: {beforeSimplify} -> {method.Body.Instructions.Count}");
-                            }
-                        }
-                        
-                        // Чистим NOPs только если они есть
-                        int nopCount = method.Body.Instructions.Count(i => i.OpCode.Code == Code.Nop);
-                        if (nopCount > 0 && method.Body.Instructions.Count > nopCount)
-                        {
-                            CleanupNopsSafe(method);
-                            wasModified = true;
-                            Log($"Removed {nopCount} NOP instructions");
-                        }
-                        
-                        // Исправляем стек (менее агрессивно)
-                        if (method.Body.Instructions.Count > 0)
-                        {
-                            int beforeFix = method.Body.Instructions.Count;
-                            FixStackImbalance(method);
-                            if (beforeFix != method.Body.Instructions.Count)
-                            {
-                                wasModified = true;
-                                Log($"Fixed stack imbalance. Instructions: {beforeFix} -> {method.Body.Instructions.Count}");
-                            }
+                            Log("Not a state machine, skipping unpacking");
                         }
                         
                         // Проверяем, не стал ли метод пустым
@@ -144,27 +126,15 @@ namespace Deobfuscator
                             count++;
                             Log($"Method successfully processed. Final instructions: {method.Body.Instructions.Count}");
                             
-                            // Показываем первые инструкции для проверки
                             if (_debugMode && method.Body.Instructions.Count > 0)
                             {
-                                Log("First 5 instructions after processing:");
+                                Log("First 10 instructions after processing:");
                                 _indentLevel++;
-                                for (int i = 0; i < Math.Min(5, method.Body.Instructions.Count); i++)
+                                for (int i = 0; i < Math.Min(10, method.Body.Instructions.Count); i++)
                                 {
                                     Log(method.Body.Instructions[i].ToString());
                                 }
                                 _indentLevel--;
-                            }
-                        }
-                        
-                        // AI переименование (только если метод не пустой)
-                        if (_aiAssistant != null && method.Body.Instructions.Count > 0 && IsObfuscatedName(method.Name))
-                        {
-                            string oldName = method.Name;
-                            RenameWithAi(method);
-                            if (oldName != method.Name)
-                            {
-                                Log($"Renamed: {oldName} -> {method.Name}");
                             }
                         }
                     }
@@ -187,32 +157,37 @@ namespace Deobfuscator
             Log("=== Deobfuscation Finished ===");
         }
 
-        private bool LooksLikeStateMachine(MethodDef method)
+        private bool IsDefinitelyStateMachine(MethodDef method)
         {
             var instructions = method.Body.Instructions;
-            if (instructions.Count < 10) return false;
+            if (instructions.Count < 20) return false;
             
-            // Ищем характерные паттерны state machine
-            int stateVarHints = 0;
-            int switchHints = 0;
+            int statePatterns = 0;
+            int switchInstructions = 0;
             
             for (int i = 0; i < instructions.Count - 3; i++)
             {
-                // Паттерн: stloc (состояние) + сравнение
-                if (IsStloc(instructions[i + 1], out _) && 
-                    GetConstantValue(instructions[i]) != null)
+                // Паттерн: загрузка переменной состояния + сравнение + ветвление
+                if (IsLdloc(instructions[i], out int idx) &&
+                    GetConstantValue(instructions[i + 1]) != null &&
+                    (instructions[i + 2].OpCode.Code == Code.Ceq || 
+                     instructions[i + 2].OpCode.Code == Code.Cgt ||
+                     instructions[i + 2].OpCode.Code == Code.Clt) &&
+                    (instructions[i + 3].OpCode.Code == Code.Brtrue ||
+                     instructions[i + 3].OpCode.Code == Code.Brfalse))
                 {
-                    stateVarHints++;
+                    statePatterns++;
                 }
                 
                 // Паттерн: switch
                 if (instructions[i].OpCode.Code == Code.Switch)
                 {
-                    switchHints++;
+                    switchInstructions++;
                 }
             }
             
-            return stateVarHints > 2 || switchHints > 0;
+            // Метод считается state machine если есть минимум 3 паттерна состояний или switch
+            return statePatterns >= 3 || switchInstructions > 0;
         }
 
         private bool UnpackStateMachineSafe(MethodDef method)
@@ -223,19 +198,25 @@ namespace Deobfuscator
             {
                 bool result = UnpackStateMachine(method);
                 
-                // Проверяем, не испортили ли мы метод
                 if (result && method.Body.Instructions.Count > 0)
                 {
-                    // Убеждаемся, что метод заканчивается на ret или throw
                     var lastInstr = method.Body.Instructions.LastOrDefault();
                     if (lastInstr != null && 
                         lastInstr.OpCode.Code != Code.Ret && 
                         lastInstr.OpCode.Code != Code.Throw)
                     {
-                        Log("Method doesn't end with ret/throw, restoring...");
-                        RestoreMethod(method, backup);
-                        return false;
+                        Log("Method doesn't end with ret/throw, adding ret...");
+                        method.Body.Instructions.Add(Instruction.Create(OpCodes.Ret));
+                        method.Body.UpdateInstructionOffsets();
                     }
+                    
+                    // Проверяем, что метод не стал слишком маленьким
+                    if (method.Body.Instructions.Count < backup.Count / 3)
+                    {
+                        Log($"Method became too small ({method.Body.Instructions.Count} vs {backup.Count}), may be over-aggressive");
+                        // Не восстанавливаем, но логируем
+                    }
+                    
                     return true;
                 }
             }
@@ -300,13 +281,24 @@ namespace Deobfuscator
                     var target = instr4.Operand as Instruction;
                     if (target != null)
                     {
-                        var block = ExtractBlock(instructions, target, stateVarIndex, out object? nextVal);
+                        var block = ExtractBlockImproved(instructions, target, stateVarIndex, out object? nextVal);
                         
                         if (!stateBlocks.ContainsKey(checkVal) && block.Count > 0)
                         {
                             stateBlocks[checkVal] = block;
                             transitions[checkVal] = nextVal;
-                            Log($"Found block for state {checkVal}. Instructions: {block.Count}");
+                            Log($"Found block for state {checkVal}. Next state: {nextVal}. Instructions: {block.Count}");
+                            
+                            if (_debugMode && block.Count > 0)
+                            {
+                                _indentLevel++;
+                                foreach (var ins in block.Take(5))
+                                {
+                                    Log($"  {ins}");
+                                }
+                                if (block.Count > 5) Log($"  ... and {block.Count - 5} more");
+                                _indentLevel--;
+                            }
                         }
                     }
                 }
@@ -325,15 +317,21 @@ namespace Deobfuscator
 
             if (initialState != null) queue.Enqueue(initialState);
 
+            Log("Reconstructing linear flow...");
+
             while (queue.Count > 0)
             {
                 var currentState = queue.Dequeue();
                 if (visited.Contains(currentState)) continue;
                 visited.Add(currentState);
+                Log($"Processing state: {currentState}");
 
                 if (stateBlocks.TryGetValue(currentState, out var block))
                 {
-                    finalInstructions.AddRange(block.Select(CloneInstruction));
+                    foreach (var ins in block)
+                    {
+                        finalInstructions.Add(CloneInstruction(ins));
+                    }
                 }
 
                 if (transitions.TryGetValue(currentState, out var nextVal) && nextVal != null)
@@ -349,16 +347,93 @@ namespace Deobfuscator
                 return false;
             }
 
-            // Добавляем ret если его нет
-            if (finalInstructions.LastOrDefault()?.OpCode.Code != Code.Ret &&
-                finalInstructions.LastOrDefault()?.OpCode.Code != Code.Throw)
-            {
-                finalInstructions.Add(Instruction.Create(OpCodes.Ret));
-                Log("Added missing ret instruction");
-            }
-
+            Log($"Final instruction count: {finalInstructions.Count}");
             ReplaceMethodBody(method, finalInstructions);
             return true;
+        }
+
+        private List<Instruction> ExtractBlockImproved(IList<Instruction> allInstructions, Instruction startInstr, int stateVarIndex, out object? nextState)
+        {
+            var block = new List<Instruction>();
+            nextState = null;
+
+            int startIndex = allInstructions.IndexOf(startInstr);
+            if (startIndex == -1) return block;
+
+            int ip = startIndex;
+            int maxBlockLen = 200; // Увеличиваем максимальную длину блока
+            
+            while (ip < allInstructions.Count)
+            {
+                var instr = allInstructions[ip];
+                
+                // Проверяем на достижение конца блока - встречаем запись в stateVar
+                if (ip + 1 < allInstructions.Count)
+                {
+                    var nextIns = allInstructions[ip + 1];
+                    if (IsStloc(nextIns, out int sIdx) && sIdx == stateVarIndex)
+                    {
+                        var val = GetConstantValue(instr);
+                        if (val != null)
+                        {
+                            nextState = val;
+                            Log($"    Block ends at state transition to {val}");
+                            break;
+                        }
+                    }
+                }
+                
+                // Если дошли до ret - добавляем и выходим
+                if (instr.OpCode.Code == Code.Ret)
+                {
+                    block.Add(CloneInstruction(instr));
+                    Log($"    Block ends with ret");
+                    break;
+                }
+                
+                // Если дошли до throw - добавляем и выходим
+                if (instr.OpCode.Code == Code.Throw)
+                {
+                    block.Add(CloneInstruction(instr));
+                    Log($"    Block ends with throw");
+                    break;
+                }
+                
+                // Добавляем инструкцию в блок (включая почти всё)
+                // Пропускаем только загрузки переменной состояния
+                bool shouldSkip = false;
+                
+                // Пропускаем только загрузку переменной состояния
+                if (GetLocalIndex(instr) == stateVarIndex && 
+                   (instr.OpCode.Code == Code.Ldloc || instr.OpCode.Code == Code.Ldloc_S ||
+                    (instr.OpCode.Code >= Code.Ldloc_0 && instr.OpCode.Code <= Code.Ldloc_3)))
+                {
+                    shouldSkip = true;
+                    Log($"    [Skip] State load: {instr}");
+                }
+                
+                // НЕ пропускаем сравнения и ветвления - они могут быть частью логики
+                // Пропускаем только если это явно часть механизма state machine
+                if (!shouldSkip)
+                {
+                    block.Add(CloneInstruction(instr));
+                    if (_debugMode && block.Count <= 10)
+                    {
+                        Log($"    [Add] {instr}");
+                    }
+                }
+                
+                ip++;
+                
+                // Защита от бесконечного цикла
+                if (block.Count > maxBlockLen)
+                {
+                    Log($"    Block exceeded max length ({maxBlockLen}), stopping");
+                    break;
+                }
+            }
+            
+            return block;
         }
 
         private void SimplifyConditionsSafe(MethodDef method)
@@ -369,7 +444,6 @@ namespace Deobfuscator
             {
                 SimplifyConditions(method);
                 
-                // Если метод стал пустым после упрощения, восстанавливаем
                 if (method.Body.Instructions.Count == 0)
                 {
                     Log("SimplifyConditions made method empty, restoring...");
@@ -447,7 +521,6 @@ namespace Deobfuscator
             if (body == null) return;
             var instrs = body.Instructions;
             
-            // Не обрабатываем слишком маленькие методы
             if (instrs.Count < 3) return;
             
             bool changed = true;
@@ -463,41 +536,23 @@ namespace Deobfuscator
                 {
                     var instr = instrs[i];
                     
-                    // Не удаляем критические инструкции
                     if (instr.OpCode.Code == Code.Ret || 
                         instr.OpCode.Code == Code.Throw ||
                         instr.OpCode.Code == Code.Call ||
                         instr.OpCode.Code == Code.Callvirt)
                         continue;
                     
-                    // Проверяем, не является ли инструкция целевой для перехода
                     bool isTarget = instrs.Any(ins => 
                         (ins.Operand == instr) || 
                         (ins.Operand is Instruction[] arr && arr.Contains(instr)));
                     
                     if (isTarget) continue;
                     
-                    // Удаляем только изолированные NOPs
                     if (instr.OpCode.Code == Code.Nop && !isTarget)
                     {
                         instrs.RemoveAt(i);
                         changed = true;
                         continue;
-                    }
-                    
-                    // Удаляем неиспользуемые константы только если они точно не нужны
-                    if ((instr.OpCode.Code == Code.Ldc_I4 || instr.OpCode.Code == Code.Ldc_I8) && 
-                        i + 1 < instrs.Count)
-                    {
-                        var next = instrs[i + 1];
-                        // Удаляем только если следующая инструкция - NOP или другая константа
-                        if (next.OpCode.Code == Code.Nop || 
-                            next.OpCode.Code == Code.Ldc_I4 ||
-                            next.OpCode.Code == Code.Ldc_I8)
-                        {
-                            instrs.RemoveAt(i);
-                            changed = true;
-                        }
                     }
                 }
             }
@@ -614,83 +669,6 @@ namespace Deobfuscator
                 }
             }
             if (changed) body.UpdateInstructionOffsets();
-        }
-
-        private List<Instruction> ExtractBlock(IList<Instruction> allInstructions, Instruction startInstr, int stateVarIndex, out object? nextState)
-        {
-            var block = new List<Instruction>();
-            nextState = null;
-
-            int startIndex = allInstructions.IndexOf(startInstr);
-            if (startIndex == -1) return block;
-
-            int ip = startIndex;
-            int maxBlockLen = 100; 
-            int count = 0;
-
-            while (ip < allInstructions.Count && count < maxBlockLen)
-            {
-                var instr = allInstructions[ip];
-                count++;
-
-                if (ip + 1 < allInstructions.Count)
-                {
-                    var nextIns = allInstructions[ip+1];
-                    if (IsStloc(nextIns, out int sIdx) && sIdx == stateVarIndex)
-                    {
-                        var val = GetConstantValue(instr);
-                        if (val != null)
-                        {
-                            nextState = val;
-                            break; 
-                        }
-                    }
-                }
-
-                if (instr.OpCode.FlowControl == FlowControl.Return)
-                {
-                    block.Add(CloneInstruction(instr));
-                    break;
-                }
-                
-                if (instr.OpCode.FlowControl == FlowControl.Branch && instr.Operand is Instruction t)
-                {
-                    int tIdx = allInstructions.IndexOf(t);
-                    if (tIdx > ip) 
-                        break;
-                }
-
-                // Добавляем инструкцию в блок, пропуская только явный мусор
-                bool isJunk = false;
-
-                if (GetLocalIndex(instr) == stateVarIndex && 
-                   (instr.OpCode.Code == Code.Ldloc || instr.OpCode.Code == Code.Ldloc_S ||
-                    (instr.OpCode.Code >= Code.Ldloc_0 && instr.OpCode.Code <= Code.Ldloc_3)))
-                {
-                    isJunk = true;
-                }
-
-                if (!isJunk && (instr.OpCode.Code == Code.Ceq || instr.OpCode.Code == Code.Cgt || 
-                    instr.OpCode.Code == Code.Clt || instr.OpCode.Code == Code.Cgt_Un || 
-                    instr.OpCode.Code == Code.Clt_Un))
-                {
-                    isJunk = true;
-                }
-
-                if (!isJunk && (instr.OpCode.FlowControl == FlowControl.Cond_Branch))
-                {
-                    isJunk = true;
-                }
-
-                if (!isJunk)
-                {
-                    block.Add(CloneInstruction(instr));
-                }
-
-                ip++;
-            }
-
-            return block;
         }
 
         private void RestoreMethod(MethodDef method, List<Instruction> backupInstructions)
