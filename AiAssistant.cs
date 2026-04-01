@@ -10,7 +10,6 @@ namespace Deobfuscator
     public class AiAssistant : IDisposable
     {
         private readonly AiConfig _config;
-        private HttpWebRequest? _currentRequest;
 
         public bool Enabled => _config.Enabled;
 
@@ -25,39 +24,30 @@ namespace Deobfuscator
 
             try
             {
-                // Ограничим входные данные, чтобы не превысить лимиты токенов
-                string ilSnippet = methodBodyIl.Length > 1000 ? methodBodyIl.Substring(0, 1000) + "..." : methodBodyIl;
+                // Формируем промпт
+                string prompt = $"Analyze this C# method IL code and suggest a short, meaningful camelCase name. Return ONLY the name.\n" +
+                                $"Context: {returnType}\n" +
+                                $"IL Snippet:\n{methodBodyIl}";
 
-                string prompt = $"You are a reverse engineering expert. Analyze this C# IL code snippet and suggest a concise, meaningful camelCase name for the method. Return ONLY the name, no explanation, no quotes.\n" +
-                                $"Return type: {returnType}\n" +
-                                $"Current obfuscated name: {currentName}\n" +
-                                $"IL Code:\n{ilSnippet}";
-
-                // Подготовка тела запроса для Ollama / LM Studio
+                // Подготовка JSON для Ollama / совместимых API
                 var requestBody = new
                 {
                     model = _config.Model,
                     prompt = prompt,
                     stream = false,
-                    options = new { temperature = 0.1, num_predict = 20, stop = new[] { "\n", ".", " " } }
+                    options = new { temperature = 0.1, num_predict = 20 }
                 };
 
                 string json = JsonConvert.SerializeObject(requestBody);
                 byte[] data = Encoding.UTF8.GetBytes(json);
 
-                // Пробуем основной URL
-                string endpoint = $"{_config.ApiUrl}/api/generate";
-                
-                // Если используется OpenAI-compatible API (LM Studio часто использует /v1/chat/completions)
-                // Но для простоты оставим /api/generate как стандарт Ollama. 
-                // Если 404, попробуем альтернативу в catch блоке или проверим ответ.
+                // Создаем запрос
+                var request = (HttpWebRequest)WebRequest.Create($"{_config.ApiUrl}/api/generate");
+                request.Method = "POST";
+                request.ContentType = "application/json";
+                request.Timeout = _config.TimeoutSeconds * 1000;
 
-                _currentRequest = (HttpWebRequest)WebRequest.Create(endpoint);
-                _currentRequest.Method = "POST";
-                _currentRequest.ContentType = "application/json";
-                _currentRequest.Timeout = _config.TimeoutSeconds * 1000;
-
-                using (var stream = _currentRequest.GetRequestStream())
+                using (var stream = request.GetRequestStream())
                 {
                     stream.Write(data, 0, data.Length);
                 }
@@ -65,60 +55,47 @@ namespace Deobfuscator
                 HttpWebResponse response;
                 try
                 {
-                    response = (HttpWebResponse)_currentRequest.GetResponse();
+                    response = (HttpWebResponse)request.GetResponse();
                 }
                 catch (WebException we)
                 {
-                    if (we.Response is HttpWebResponse errResp)
+                    if (we.Response != null)
                     {
-                        Console.WriteLine($"[AI] Server returned status: {(int)errResp.StatusCode} {errResp.StatusCode}");
-                        using (var reader = new StreamReader(errResp.GetResponseStream()))
+                        using (var errReader = new StreamReader(we.Response.GetResponseStream()))
                         {
-                            Console.WriteLine($"[AI] Error details: {reader.ReadToEnd()}");
+                            Console.WriteLine($"[AI HTTP Error]: {we.Status} - {errReader.ReadToEnd()}");
                         }
                     }
-                    throw;
+                    else
+                    {
+                        Console.WriteLine($"[AI Network Error]: {we.Message}");
+                    }
+                    return null;
                 }
 
                 using (response)
                 using (var reader = new StreamReader(response.GetResponseStream()))
                 {
                     string result = reader.ReadToEnd();
-                    
-                    // Парсинг ответа Ollama
                     var jsonResponse = JObject.Parse(result);
-                    string generatedText = jsonResponse["response"]?.ToString().Trim() ?? "";
                     
-                    // Очистка от лишних символов
-                    generatedText = generatedText.Replace("\"", "").Replace("`", "").Trim();
-                    
-                    if (string.IsNullOrEmpty(generatedText))
+                    if (jsonResponse["response"] != null)
                     {
-                        Console.WriteLine("[AI] Empty response received.");
-                        return null;
+                        return jsonResponse["response"].ToString().Trim();
                     }
-
-                    return generatedText;
+                    return null;
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[AI Error]: {ex.Message}");
-                if (ex.Message.Contains("404"))
-                {
-                    Console.WriteLine("[AI Hint]: Ensure your server supports '/api/generate' (Ollama default). For LM Studio, check settings or use compatible mode.");
-                }
+                Console.WriteLine($"[AI Exception]: {ex.Message}");
                 return null;
-            }
-            finally
-            {
-                _currentRequest = null;
             }
         }
 
         public void Dispose()
         {
-            _currentRequest?.Abort();
+            // Ресурсы освобождаются автоматически в using блоках
         }
     }
 }
