@@ -54,6 +54,19 @@ namespace Deobfuscator
             Console.WriteLine("[*] Deobfuscation complete.");
         }
 
+        // Вспомогательный метод для получения следующей инструкции
+        private Instruction? GetNextInstruction(IList<Instruction> instructions, Instruction current)
+        {
+            for (int i = 0; i < instructions.Count; i++)
+            {
+                if (instructions[i] == current && i < instructions.Count - 1)
+                {
+                    return instructions[i + 1];
+                }
+            }
+            return null;
+        }
+
         // Вспомогательный метод для получения предыдущей инструкции
         private Instruction? GetPreviousInstruction(IList<Instruction> instructions, Instruction current)
         {
@@ -176,10 +189,10 @@ namespace Deobfuscator
                             instr.Operand = nextTarget;
                             changed = true;
                         }
-                        else if (IsNopBlock(target))
+                        else if (IsNopBlock(target, instructions))
                         {
                             // Пропуск блоков nop
-                            var realTarget = FindRealTarget(target);
+                            var realTarget = FindRealTarget(target, instructions);
                             if (realTarget != null)
                             {
                                 instr.Operand = realTarget;
@@ -189,7 +202,8 @@ namespace Deobfuscator
                     }
                     
                     // Удаление безусловных переходов на следующую инструкцию
-                    if (instr.OpCode.Code == Code.Br && instr.Operand is Instruction nextInstr && nextInstr == instr.Next)
+                    var nextInstruction = GetNextInstruction(instructions, instr);
+                    if (instr.OpCode.Code == Code.Br && instr.Operand is Instruction nextInstr && nextInstr == nextInstruction)
                     {
                         instr.OpCode = OpCodes.Nop;
                         instr.Operand = null;
@@ -199,7 +213,7 @@ namespace Deobfuscator
                 
                 // Обновляем список инструкций после изменений (dnlib требует пересчета)
                 if (changed)
-                    method.Body.SimplifyMacros();
+                    method.Body.SimplifyMacros(method.Parameters);
             }
             
             // Распутывание кода с переменной состояния (state variable obfuscation)
@@ -399,7 +413,7 @@ namespace Deobfuscator
                                 if (instructions[j - 1].OpCode.Code == Code.Ldc_I8)
                                     nextState = (long)instructions[j - 1].Operand!;
                                 else if (instructions[j - 1].OpCode.Code == Code.Ldc_I4)
-                                    nextState = (int)instructions[j - 1].Operand!;
+                                    nextState = Convert.ToInt64((int)instructions[j - 1].Operand!);
                                 else if (instructions[j - 1].OpCode.Code == Code.Ldc_R8)
                                     nextState = Convert.ToInt64((double)instructions[j - 1].Operand!);
                                 
@@ -443,7 +457,7 @@ namespace Deobfuscator
                     if (prev.OpCode.Code == Code.Ldc_I8)
                         return (long)prev.Operand!;
                     if (prev.OpCode.Code == Code.Ldc_I4)
-                        return (int)prev.Operand!;
+                        return Convert.ToInt64((int)prev.Operand!);
                     if (prev.OpCode.Code == Code.Ldc_R8)
                         return Convert.ToInt64((double)prev.Operand!);
                 }
@@ -470,7 +484,7 @@ namespace Deobfuscator
                         if (instructions[i - 2].OpCode.Code == Code.Ldc_I8)
                             exitStates.Add((long)instructions[i - 2].Operand!);
                         else if (instructions[i - 2].OpCode.Code == Code.Ldc_I4)
-                            exitStates.Add((int)instructions[i - 2].Operand!);
+                            exitStates.Add(Convert.ToInt64((int)instructions[i - 2].Operand!));
                         else if (instructions[i - 2].OpCode.Code == Code.Ldc_R8)
                             exitStates.Add(Convert.ToInt64((double)instructions[i - 2].Operand!));
                     }
@@ -610,24 +624,24 @@ namespace Deobfuscator
             method.Body.OptimizeMacros();
         }
 
-        private bool IsNopBlock(Instruction instr)
+        private bool IsNopBlock(Instruction instr, IList<Instruction> instructions)
         {
             int count = 0;
             var curr = instr;
             while (curr != null && curr.OpCode.Code == Code.Nop && count < 10)
             {
-                curr = curr.Next;
+                curr = GetNextInstruction(instructions, curr);
                 count++;
             }
             return count > 0 && curr != null;
         }
 
-        private Instruction? FindRealTarget(Instruction start)
+        private Instruction? FindRealTarget(Instruction start, IList<Instruction> instructions)
         {
             var curr = start;
             while (curr != null && curr.OpCode.Code == Code.Nop)
             {
-                curr = curr.Next;
+                curr = GetNextInstruction(instructions, curr);
             }
             return curr;
         }
