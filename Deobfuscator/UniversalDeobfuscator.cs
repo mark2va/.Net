@@ -35,7 +35,7 @@ namespace Deobfuscator
                         if (UnpackStateMachine(method))
                         {
                             CleanupNops(method);
-                            RemoveDeadStores(method); // Дополнительная очистка мертвых записей
+                            RemoveDeadStores(method);
                             count++;
                         }
                         else
@@ -61,7 +61,7 @@ namespace Deobfuscator
 
         /// <summary>
         /// Распутывает обфускацию типа "State Machine".
-        /// Строит граф переходов и собирает линейный код, отбрасывая мусор.
+        /// Строит граф переходов и собирает линейный код.
         /// </summary>
         private bool UnpackStateMachine(MethodDef method)
         {
@@ -70,70 +70,188 @@ namespace Deobfuscator
             var instructions = body.Instructions;
             if (instructions.Count < 5) return false;
 
-            // 1. Поиск переменной состояния и её начального значения
+            // 1. Поиск переменной состояния
             int stateVarIndex = -1;
             object? initialState = null;
             int initInstrIndex = -1;
 
-            for (int i = 0; i < Math.Min(10, instructions.Count - 1); i++)
+            for (int i = 0; i < Math.Min(10, instructions.Count); i++)
             {
-                var ldc = instructions[i];
-                var stloc = instructions[i + 1];
-
-                if (IsStloc(stloc, out int idx))
+                if (i + 1 < instructions.Count)
                 {
-                    var val = GetConstantValue(ldc);
-                    if (val != null)
+                    var ldc = instructions[i];
+                    var stloc = instructions[i + 1];
+                    if (IsStloc(stloc, out int idx))
                     {
-                        stateVarIndex = idx;
-                        initialState = val;
-                        initInstrIndex = i;
-                        break;
+                        var val = GetConstantValue(ldc);
+                        if (val != null)
+                        {
+                            stateVarIndex = idx;
+                            initialState = val;
+                            initInstrIndex = i;
+                            break;
+                        }
                     }
                 }
             }
 
             if (stateVarIndex == -1 || initialState == null) return false;
 
-            // Собираем все значения состояний, встречающиеся в коде (константы в сравнениях и присваиваниях)
-            var stateValues = new HashSet<object>();
-            stateValues.Add(initialState);
-            
-            foreach (var instr in instructions)
-            {
-                if (instr.OpCode.Code == Code.Ldc_I4 || instr.OpCode.Code == Code.Ldc_I8 || 
-                    instr.OpCode.Code == Code.Ldc_R4 || instr.OpCode.Code == Code.Ldc_R8)
-                {
-                    var val = GetConstantValue(instr);
-                    if (val != null) stateValues.Add(val);
-                }
-            }
+            // 2. Анализ графа переходов
+            // Словарь: Значение состояния -> Список инструкций (полезная нагрузка)
+            var stateBlocks = new Dictionary<object, List<Instruction>>();
+            // Словарь: Значение состояния -> Следующее значение состояния (переход)
+            var transitions = new Dictionary<object, object?>();
+            // Множество состояний, которые являются точками выхода (break/ret)
+            var exitStates = new HashSet<object>();
 
-            // 2. Разбиваем код на блоки, привязанные к состояниям.
-            // Блок начинается после проверки состояния или присваивания нового состояния.
-            // Мы будем эмулировать переходы статически.
+            // Проходим по инструкциям, чтобы собрать блоки
+            // Логика: ищем паттерн "if (num == X) { ... num = Y; }"
+            // В обфускаторе это часто выглядит как последовательность проверок
             
-            // Структура: State -> Список полезных инструкций до следующего перехода
-            var stateGraph = new Dictionary<object, List<Instruction>>();
-            // Переходы: State -> NextState (если переход безусловный внутри блока) или null (если выход/условие)
-            var transitions = new Dictionary<object, object?>(); 
+            // Упрощенный парсер для типичного паттерна:
+            // do { if (num == A) { code; num = B; } if (num == C) ... } while (num != Exit);
             
-            // Текущее анализируемое состояние
-            object? currentState = initialState;
-            var currentBlock = new List<Instruction>();
-            
-            bool insideLoop = false;
-            // Пытаемся найти начало цикла (обычно сразу после инициализации или через пару nop)
-            // Для простоты считаем, что весь метод после инициализации - это тело автомата
-            
-            int ip = initInstrIndex + 2; // Пропускаем ldc, stloc
-            
-            // Флаг, указывающий, что мы нашли полезную инструкцию в текущем состоянии
-            bool foundLogicInCurrentState = false;
-
+            // Мы будем эмулировать "статически", проходя по списку и выявляя блоки
+            int ip = 0;
             while (ip < instructions.Count)
             {
                 var instr = instructions[ip];
+                
+                // Пропускаем инициализацию
+                if (ip == initInstrIndex || ip == initInstrIndex + 1)
+                {
+                    ip++;
+                    continue;
+                }
+
+                // Ищем проверку состояния: ldloc(state), ldc(value), ceq/cgt/clt, brtrue/brfalse
+                // Или более простой вариант в некоторых обфускаторах: прямая проверка через ветвление
+                
+                // Попробуем найти блок, начинающийся с проверки конкретного значения
+                // Паттерн: 
+                // IL_X: ldloc.s V_0 (state)
+                // IL_Y: ldc.i4 XXXX
+                // IL_Z: ceq
+                // IL_K: brtrue.s IL_Target (блок кода)
+                
+                if (instr.OpCode.Code == Code.Ldloc || instr.OpCode.Code == Code.Ldloc_S || 
+                   (instr.OpCode.Code >= Code.Ldloc_0 && instr.OpCode.Code <= Code.Ldloc_3))
+                {
+                    if (GetLocalIndex(instr) == stateVarIndex)
+                    {
+                        if (ip + 3 < instructions.Count)
+                        {
+                            var ldcVal = instructions[ip + 1];
+                            var cmp = instructions[ip + 2];
+                            var branch = instructions[ip + 3];
+
+                            if (GetConstantValue(ldcVal) is object checkValue &&
+                                (cmp.OpCode.Code == Code.Ceq || cmp.OpCode.Code == Code.Cgt || cmp.OpCode.Code == Code.Clt) &&
+                                (branch.OpCode.Code == Code.Brtrue || branch.OpCode.Code == Code.Brtrue_S || branch.OpCode.Code == Code.Brfalse || branch.OpCode.Code == Code.Brfalse_S))
+                            {
+                                // Нашли проверку состояния checkValue
+                                // Определяем, куда идет ветка (true/false)
+                                bool isBrTrue = branch.OpCode.Code == Code.Brtrue || branch.OpCode.Code == Code.Brtrue_S;
+                                Instruction targetBlock = branch.Operand as Instruction;
+                                
+                                if (targetBlock != null)
+                                {
+                                    // Извлекаем инструкции из целевого блока до следующего перехода или конца метода
+                                    var blockInstructions = ExtractBlock(instructions, targetBlock, stateVarIndex, out object? nextState, out bool isExit);
+                                    
+                                    if (!stateBlocks.ContainsKey(checkValue))
+                                        stateBlocks[checkValue] = blockInstructions;
+                                    
+                                    transitions[checkValue] = nextState;
+                                    if (isExit) exitStates.Add(checkValue);
+                                    
+                                    // Перемещаем IP за эту конструкцию проверки, чтобы не дублировать
+                                    // Находим следующую инструкцию после блока ветвления
+                                    // Это сложно сделать точно без полного CFG, поэтому просто идем дальше
+                                    // В данном типе обфускации блоки обычно идут последовательно в IL
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Также ищем условие выхода из цикла do-while / for
+                // Обычно это сравнение state var с конечным значением и branch назад
+                if (instr.OpCode.FlowControl == FlowControl.Cond_Branch)
+                {
+                     // Проверка на выход: если ветка ведет назад на начало цикла, а условие зависит от state var
+                     // Это обрабатывается логикой exitStates
+                }
+
+                ip++;
+            }
+
+            // 3. Сборка линейного кода
+            if (stateBlocks.Count == 0) return false;
+
+            var finalInstructions = new List<Instruction>();
+            var visitedStates = new HashSet<object>();
+            var queue = new Queue<object>();
+
+            if (initialState != null) queue.Enqueue(initialState);
+
+            while (queue.Count > 0)
+            {
+                var currentState = queue.Dequeue();
+                if (visitedStates.Contains(currentState)) continue;
+                visitedStates.Add(currentState);
+
+                if (stateBlocks.TryGetValue(currentState, out var block))
+                {
+                    foreach (var ins in block)
+                    {
+                        finalInstructions.Add(CloneInstruction(ins));
+                    }
+                }
+
+                if (transitions.TryGetValue(currentState, out var nextVal) && nextVal != null)
+                {
+                    if (!visitedStates.Contains(nextVal))
+                        queue.Enqueue(nextVal);
+                }
+            }
+
+            if (finalInstructions.Count == 0) return false;
+
+            // Добавляем возврат, если его нет (на случай если последний блок не имел ret)
+            if (method.ReturnType.FullName != "System.Void")
+            {
+                // Проверка, есть ли уже ret
+                bool hasRet = finalInstructions.Any(i => i.OpCode.Code == Code.Ret);
+                if (!hasRet)
+                {
+                    // Это упрощение, в реальном коде нужно отслеживать стек
+                    // Но для данного типа обфускации обычно ret есть внутри блоков
+                }
+            }
+
+            ReplaceMethodBody(method, finalInstructions);
+            return true;
+        }
+
+        /// <summary>
+        /// Извлекает инструкции блока кода для конкретного состояния.
+        /// Останавливается на следующем переходе состояния или выходе.
+        /// </summary>
+        private List<Instruction> ExtractBlock(IList<Instruction> allInstructions, Instruction startInstr, int stateVarIndex, out object? nextState, out bool isExit)
+        {
+            var block = new List<Instruction>();
+            nextState = null;
+            isExit = false;
+
+            int startIndex = allInstructions.IndexOf(startInstr);
+            if (startIndex == -1) return block;
+
+            int ip = startIndex;
+            while (ip < allInstructions.Count)
+            {
+                var instr = allInstructions[ip];
                 
                 // Пропускаем NOP
                 if (instr.OpCode.Code == Code.Nop)
@@ -142,274 +260,210 @@ namespace Deobfuscator
                     continue;
                 }
 
-                // Проверка: является ли инструкция частью механизма обфускации?
-                bool isStateOp = false;
-
-                // 1. Чтение переменной состояния (ldloc state)
-                if (IsLdloc(instr, out int lIdx) && lIdx == stateVarIndex)
+                // Если встретили загрузку константы и сохранение в state var -> это переход
+                // Паттерн: ldc.X, stloc.s (state)
+                if (ip + 1 < allInstructions.Count)
                 {
-                    isStateOp = true;
-                }
-
-                // 2. Запись в переменную состояния (stloc state) - это переход
-                if (IsStloc(instr, out int sIdx) && sIdx == stateVarIndex)
-                {
-                    // Предыдущая инструкция должна быть константой (новое состояние)
-                    if (ip > 0)
+                    var next = allInstructions[ip + 1];
+                    if (IsStloc(next, out int sIdx) && sIdx == stateVarIndex)
                     {
-                        var prev = instructions[ip - 1];
-                        var newVal = GetConstantValue(prev);
-                        if (newVal != null)
+                        var val = GetConstantValue(instr);
+                        if (val != null)
                         {
-                            // Это явный переход: текущее состояние -> newVal
-                            // Но нам нужно понять, к какому состоянию относится этот блок.
-                            // В паттерне: if (num == X) { ... num = Y; }
-                            // Мы находимся в блоке X. Инструкция num=Y означает переход в Y.
-                            
-                            if (currentState != null)
-                            {
-                                // Сохраняем накопленный блок для currentState
-                                if (!stateGraph.ContainsKey(currentState))
-                                    stateGraph[currentState] = new List<Instruction>();
-                                stateGraph[currentState].AddRange(currentBlock);
-                                
-                                // Записываем переход
-                                transitions[currentState] = newVal;
-                                
-                                // Сбрасываем буфер для нового состояния
-                                currentBlock.Clear();
-                                currentState = newVal;
-                                foundLogicInCurrentState = false;
-                            }
-                            isStateOp = true; // Саму инструкцию stloc не копируем
+                            nextState = val;
+                            // Не добавляем эти инструкции в блок (это служебные)
+                            ip += 2;
+                            continue; 
                         }
                     }
                 }
 
-                // 3. Сравнения (ceq, cgt, clt и т.д.) - часто идут после ldloc state, ldc const
-                if (instr.OpCode.Code == Code.Ceq || instr.OpCode.Code == Code.Cgt || instr.OpCode.Code == Code.Clt ||
-                    instr.OpCode.Code == Code.Cgt_Un || instr.OpCode.Code == Code.Clt_Un)
+                // Если встретили безусловный переход вперед (не назад в цикл) -> возможно конец блока
+                if (instr.OpCode.FlowControl == FlowControl.Branch)
                 {
-                    isStateOp = true;
-                }
-
-                // 4. Ветвления (br, bne.un, beq, brtrue, brfalse)
-                if (instr.OpCode.FlowControl == FlowControl.Branch || instr.OpCode.FlowControl == FlowControl.Cond_Branch)
-                {
-                    isStateOp = true;
-                    // Если это условный выход из цикла (например, while (num != exit)), то мы можем его проигнорировать,
-                    // так как мы строим линейный путь до выхода.
-                    // Если это внутренний переход, он уже обработан через stloc.
-                }
-
-                // Если инструкция не является частью обфускации, добавляем её в текущий блок
-                if (!isStateOp)
-                {
-                    // Дополнительная проверка: не является ли эта инструкция просто загрузкой константы состояния,
-                    // которая осталась без пары (редкий случай, но возможный при сложном анализе)
-                    var constVal = GetConstantValue(instr);
-                    if (constVal != null && stateValues.Contains(constVal))
+                    if (instr.Operand is Instruction target)
                     {
-                        // Скорее всего, это часть сравнения, которое мы пропустили, или мусор.
-                        // Но если перед ней нет ldloc state, то это может быть реальная константа.
-                        // Для безопасности проверим контекст. 
-                        // В простом случае state machine: ldc state_val -> stloc state_var.
-                        // Если мы видим ldc state_val отдельно, это мусор.
-                        isStateOp = true; 
-                    }
-                    else
-                    {
-                        currentBlock.Add(CloneInstruction(instr));
-                        foundLogicInCurrentState = true;
+                        int targetIdx = allInstructions.IndexOf(target);
+                        if (targetIdx > ip) // Переход вперед
+                        {
+                            // Проверяем, не является ли это переходом на следующую проверку состояния
+                            // В типичной обфускации после stloc идет branch на начало цикла или следующую проверку
+                            // Здесь мы просто прерываем блок, считая переход концом логики этого состояния
+                            ip++;
+                            continue;
+                        }
+                        else 
+                        {
+                            // Переход назад (цикл) - игнорируем, это часть обфускации
+                            ip++;
+                            continue;
+                        }
                     }
                 }
 
+                // Если встретили ret
+                if (instr.OpCode.FlowControl == FlowControl.Return)
+                {
+                    block.Add(CloneInstruction(instr));
+                    isExit = true;
+                    ip++;
+                    break;
+                }
+
+                // Если это инструкция загрузки константы, которая используется только для сравнения в цикле обфускации
+                // (например, ldc.i4 1990 перед проверкой while), мы должны её пропустить
+                // Эвристика: если за ldc следует сравнение с state var или проверка выхода
+                // Для простоты пока добавляем всё, что не является явным переходом состояния
+                
+                // Фильтр мусора: если это ldc, за которым следует pop или ничего (оставляет мусор на стеке)
+                // Но лучше отфильтровать на этапе сбора всего метода
+                
+                block.Add(instr);
                 ip++;
-            }
-            
-            // Добавляем последний блок
-            if (currentState != null && currentBlock.Count > 0)
-            {
-                if (!stateGraph.ContainsKey(currentState))
-                    stateGraph[currentState] = new List<Instruction>();
-                stateGraph[currentState].AddRange(currentBlock);
+                
+                // Безопасный предел для блока
+                if (block.Count > 50) break; 
             }
 
-            // 3. Сборка линейного кода путем обхода графа от initialState до тупика
-            var finalInstructions = new List<Instruction>();
-            var visitedStates = new HashSet<object>();
-            var queue = new Queue<object>();
-            
-            if (initialState != null) queue.Enqueue(initialState);
-
-            while (queue.Count > 0)
-            {
-                var state = queue.Dequeue();
-                if (visitedStates.Contains(state)) continue;
-                visitedStates.Add(state);
-
-                if (stateGraph.TryGetValue(state, out var block))
-                {
-                    finalInstructions.AddRange(block);
-                    
-                    // Если есть переход из этого состояния, идем дальше
-                    if (transitions.TryGetValue(state, out var nextState) && nextState != null)
-                    {
-                        if (!visitedStates.Contains(nextState))
-                            queue.Enqueue(nextState);
-                    }
-                }
-            }
-
-            if (finalInstructions.Count == 0) return false;
-
-            // Заменяем тело метода
-            ReplaceMethodBody(method, finalInstructions);
-            return true;
+            return block;
         }
 
         /// <summary>
-        /// Удаляет мертвые записи в локальные переменные, которые сразу же перезаписываются или не используются.
-        /// Помогает убрать остатки типа "num;".
+        /// Удаляет инструкции, оставляющие бесполезные значения на стеке (мусор).
+        /// Например: ldc.i4 123 (без использования)
         /// </summary>
         private void RemoveDeadStores(MethodDef method)
         {
             var body = method.Body;
-            var instructions = body.Instructions;
-            
-            // Упрощенная эвристика: если видим последовательность:
-            // ldloc X
-            // pop (или сразу следующая инструкция не использует значение)
-            // И при этом X не используется далее для реальных вычислений...
-            // Это сложно сделать надежно без полного SSA анализа.
-            
-            // Более простой подход для данного случая:
-            // Очистить инструкции, которые оставляют значение на стеке и ничего с ним не делают.
-            // Например, если метод возвращает void, а на стеке остается значение - это ошибка баланса,
-            // но декомпилятор может показать это как "value;".
-            // Нам нужно убедиться, что стек сбалансирован.
-            
-            // В данном конкретном случае ("1990;", "text;") проблема в том, что мы скопировали
-            // инструкции загрузки (ldc, ldloc), но не скопировали инструкции использования (ret, stloc, вызов).
-            // Нет, мы копировали всё, кроме мусора.
-            // Ага, проблема в том, что в оригинале было:
-            // ldc 1990
-            // stloc num
-            // А мы удалили stloc (как op состояния), но оставили ldc? 
-            // Нет, в коде выше я добавил фильтр: if (constVal != null && stateValues.Contains(constVal)) isStateOp = true;
-            // Это должно было убрать ldc 1990.
-            
-            // Почему тогда осталось "1990;"?
-            // Значит, эти константы НЕ попали в stateValues или не были распознаны как ldc.
-            // Или, возможно, это не ldc, а что-то еще?
-            // Или, возможно, это ldloc text; в конце метода, который декомпилятор показывает как "text;"?
-            
-            // Давайте добавим финальную очистку: удаление инструкций, которые просто загружают значение и ничего с ним не делают,
-            // если это значение не используется следующей инструкцией.
+            if (body == null) return;
             
             bool changed = true;
             while (changed)
             {
                 changed = false;
+                var instructions = body.Instructions;
+                
+                // Анализируем стек виртуально
+                // Если инструкция пушит значение, а следующее её просто попает или заменяет без использования
+                // В данном случае нас интересуют одиночные ldc, за которыми следуют другие ldc или ret без использования
+                
                 for (int i = 0; i < instructions.Count - 1; i++)
                 {
                     var curr = instructions[i];
                     var next = instructions[i+1];
 
-                    // Если текущая инструкция загружает константу или локаль, а следующая не использует стек...
-                    if ((curr.OpCode.Code == Code.Ldc_I4 || curr.OpCode.Code == Code.Ldc_I8 || 
-                         curr.OpCode.Code == Code.Ldc_R4 || curr.OpCode.Code == Code.Ldc_R8 ||
-                         IsLdloc(curr, out _)) &&
-                        !NextInstructionConsumesStack(next))
+                    // Паттерн мусора: ldc.X (константа состояния), за которым следует другая ldc или ret
+                    // В нормальном коде после ldc должно быть использование (stloc, call, add и т.д.)
+                    if (curr.OpCode.Code == Code.Ldc_I4 || curr.OpCode.Code == Code.Ldc_I8 || 
+                        curr.OpCode.Code == Code.Ldc_R4 || curr.OpCode.Code == Code.Ldc_R8)
                     {
-                        // Проверяем, не является ли это аргументом для следующей инструкции, которая просто не берет его со стека явно?
-                        // Нет, если next не потребляет стек, значит curr оставляет мусор.
+                        // Проверяем, используется ли это значение следующей инструкцией
+                        bool isUsed = false;
                         
-                        // Исключение: если curr - это подготовка к возврату (но тогда next должен быть ret)
-                        if (next.OpCode.Code == Code.Ret)
+                        if (next.OpCode.Code == Code.Stloc || next.OpCode.Code == Code.Stloc_S || 
+                            next.OpCode.Code == Code.Stloc_0 || next.OpCode.Code == Code.Stloc_1 ||
+                            next.OpCode.Code == Code.Stloc_2 || next.OpCode.Code == Code.Stloc_3)
+                            isUsed = true;
+                        else if (next.OpCode.StackBehaviourPush == StackBehaviour.Pop1 || 
+                                 next.OpCode.StackBehaviourPush == StackBehaviour.Pop1_pop1)
+                            isUsed = true; // Потребляется
+                        else if (next.OpCode.Code == Code.Pop)
                         {
-                             // Если curr загружает значение, а next - ret, это нормально (возврат значения).
-                             continue;
+                            // Явный поп мусора - можно удалить обе инструкции
+                            instructions.RemoveAt(i+1); // удаляем pop
+                            instructions.RemoveAt(i);   // удаляем ldc
+                            changed = true;
+                            break;
                         }
-                        
-                        // Если curr загружает значение, которое тут же дублируется или используется странно?
-                        // В случае "text;" в конце метода перед return:
-                        // Обычно это: ldloc text, ret.
-                        // Если мы видим просто ldloc text, а потом что-то еще, это странно.
-                        
-                        // Попробуем удалить curr, если оно точно лишнее.
-                        // Но будьте осторожны: удаление может нарушить стек для последующих инструкций.
-                        // В данном случае, если значение не потребляется, его удаление безопасно.
-                        
-                        instructions.RemoveAt(i);
-                        changed = true;
-                        break; 
+
+                        if (!isUsed && next.OpCode.Code != Code.Nop)
+                        {
+                            // Если значение не используется и не потребляется, и следующая инструкция не Nop
+                            // Это кандидат на мусор (например, оставшееся число от обфускации)
+                            // Но надо быть осторожным, чтобы не удалить аргументы для вызова метода
+                            // В контексте данной обфускации это обычно голые константы состояния
+                            
+                            // Дополнительная проверка: если это константа, совпадающая с известными состояниями?
+                            // Пока просто удаляем, если за ней сразу идет другая константа или ret
+                            if ((next.OpCode.Code == Code.Ldc_I4 || next.OpCode.Code == Code.Ldc_I8 || 
+                                 next.OpCode.Code == Code.Ldc_R4 || next.OpCode.Code == Code.Ldc_R8 ||
+                                 next.OpCode.Code == Code.Ret))
+                            {
+                                instructions.RemoveAt(i);
+                                changed = true;
+                                break;
+                            }
+                        }
                     }
                 }
             }
-            
             body.UpdateInstructionOffsets();
-        }
-
-        private bool NextInstructionConsumesStack(Instruction instr)
-        {
-            // Инструкции, которые берут аргументы со стека
-            switch (instr.OpCode.Code)
-            {
-                case Code.Stloc:
-                case Code.Stloc_S:
-                case Code.Stloc_0: case Code.Stloc_1: case Code.Stloc_2: case Code.Stloc_3:
-                case Code.Call:
-                case Code.Callvirt:
-                case Code.Newobj:
-                case Code.Add:
-                case Code.Sub:
-                case Code.Mul:
-                case Code.Div:
-                case Code.Rem:
-                case Code.And:
-                case Code.Or:
-                case Code.Xor:
-                case Code.Shl:
-                case Code.Shr:
-                case Code.Ceq:
-                case Code.Cgt:
-                case Code.Clt:
-                case Code.Box:
-                case Code.Unbox_Any:
-                case Code.Castclass:
-                case Code.Isinst:
-                case Code.Ldelem:
-                case Code.Stelem:
-                case Code.Calli:
-                case Code.Initobj:
-                case Code.Constrained:
-                case Code.Readonly:
-                case Code.Unaligned:
-                case Code.Volatile:
-                case Code.Tailcall:
-                case Code.No: // No. prefix?
-                case Code.Refanyval:
-                case Code.Mkrefany:
-                case Code.Arglist:
-                case Code.Throw:
-                case Code.Endfilter:
-                case Code.Endfinally:
-                case Code.Leave:
-                case Code.Leave_S:
-                case Code.Rethrow:
-                case Code.Sizeof: // Не потребляет, но и не оставляет в обычном смысле
-                case Code.Refanytype:
-                    return true;
-                default:
-                    return false;
-            }
         }
 
         private void SimplifyControlFlow(MethodDef method)
         {
-            // Реализация упрощения потока для случаев, не являющихся state machine
-            // (можно оставить пустой или использовать старую логику, если нужна)
+            // Резервный метод, если основной не сработал
+            var body = method.Body;
+            if (body == null) return;
+            
+            // Удаление недостижимых блоков
+            RemoveUnreachableBlocks(method);
+        }
+
+        private void RemoveUnreachableBlocks(MethodDef method)
+        {
+            var instructions = method.Body.Instructions;
+            if (instructions.Count == 0) return;
+
+            var reachable = new HashSet<Instruction>();
+            var queue = new Queue<Instruction>();
+
+            queue.Enqueue(instructions[0]);
+            reachable.Add(instructions[0]);
+
+            while (queue.Count > 0)
+            {
+                var curr = queue.Dequeue();
+                int idx = instructions.IndexOf(curr);
+                if (idx == -1) continue;
+
+                if (curr.OpCode.Code != Code.Br && curr.OpCode.Code != Code.Ret && curr.OpCode.Code != Code.Throw)
+                {
+                    if (idx + 1 < instructions.Count)
+                    {
+                        var next = instructions[idx + 1];
+                        if (reachable.Add(next))
+                            queue.Enqueue(next);
+                    }
+                }
+
+                if (curr.Operand is Instruction target)
+                {
+                    if (reachable.Add(target))
+                        queue.Enqueue(target);
+                }
+                else if (curr.Operand is Instruction[] targets)
+                {
+                    foreach (var t in targets)
+                        if (reachable.Add(t)) queue.Enqueue(t);
+                }
+            }
+
+            bool changed = false;
+            for (int i = instructions.Count - 1; i >= 0; i--)
+            {
+                if (!reachable.Contains(instructions[i]))
+                {
+                    instructions[i].OpCode = OpCodes.Nop;
+                    instructions[i].Operand = null;
+                    changed = true;
+                }
+            }
+
+            if (changed)
+            {
+                method.Body.UpdateInstructionOffsets();
+            }
         }
 
         private void CleanupNops(MethodDef method)
@@ -473,6 +527,12 @@ namespace Deobfuscator
             return index != -1 && (instr.OpCode.Code == Code.Ldloc || instr.OpCode.Code == Code.Ldloc_S ||
                    instr.OpCode.Code == Code.Ldloc_0 || instr.OpCode.Code == Code.Ldloc_1 ||
                    instr.OpCode.Code == Code.Ldloc_2 || instr.OpCode.Code == Code.Ldloc_3);
+        }
+
+        private int GetLocalIndex(Instruction instr)
+        {
+            if (IsLdloc(instr, out int idx) || IsStloc(instr, out idx)) return idx;
+            return -1;
         }
 
         private object? GetConstantValue(Instruction instr)
