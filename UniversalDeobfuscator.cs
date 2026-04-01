@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using dnlib.DotNet;
 using dnlib.DotNet.Emit;
@@ -12,8 +13,9 @@ namespace Deobfuscator
         private readonly ModuleDefMD _module;
         private readonly AiAssistant? _aiAssistant;
         
-        // Хранит известные константные значения локальных переменных на текущий момент анализа
-        private Dictionary<int, object?> _knownConstants = new Dictionary<int, object?>();
+        // Словарь для хранения известных значений локальных переменных во время анализа
+        // Ключ: индекс локальной переменной, Значение: объект (double, int, etc.)
+        private Dictionary<int, object?> _knownValues = new Dictionary<int, object?>();
 
         public UniversalDeobfuscator(string filePath, AiConfig aiConfig)
         {
@@ -24,51 +26,47 @@ namespace Deobfuscator
         public void Deobfuscate()
         {
             Console.WriteLine("[*] Starting deobfuscation...");
-            
-            int methodsProcessed = 0;
+
             foreach (var type in _module.GetTypes())
             {
                 foreach (var method in type.Methods)
                 {
                     if (!method.HasBody || !method.Body.HasInstructions) continue;
-                    if (!method.Body.IsIL) continue;
 
-                    try
+                    // Включаем сохранение старого MaxStack, чтобы избежать ошибок при записи
+                    method.Body.KeepOldMaxStack = true;
+
+                    Console.WriteLine($"[*] Processing: {method.FullName}");
+
+                    // 1. Попытка распутать поток управления через симуляцию значений
+                    UnravelFlowWithSymbolicExecution(method);
+
+                    // 2. Очистка цепочек goto и nop
+                    SimplifyJumps(method);
+
+                    // 3. Удаление мертвого кода
+                    RemoveDeadCode(method);
+
+                    // 4. AI переименование (если включено)
+                    if (_aiAssistant != null && method.Name.StartsWith("<") || method.Name.StartsWith("?"))
                     {
-                        Console.WriteLine($"[*] Processing: {method.FullName}");
-                        
-                        // 1. Распутывание потока управления (самое важное для вашего примера)
-                        UnravelControlFlow(method);
-
-                        // 2. Удаление мертвого кода и NOP
-                        CleanupMethod(method);
-
-                        // 3. AI Переименование (если включено и имя странное)
-                        if (_aiAssistant != null && IsObfuscatedName(method.Name))
-                        {
-                            RenameWithAi(method);
-                        }
-
-                        methodsProcessed++;
+                        RenameWithAi(method);
                     }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"[!] Error in method {method.Name}: {ex.Message}");
-                    }
+                    
+                    // Важно: обновляем оффсеты после изменений
+                    method.Body.UpdateInstructionOffsets();
                 }
             }
-            
-            Console.WriteLine($"[*] Deobfuscation complete. Processed {methodsProcessed} methods.");
+
+            Console.WriteLine("[*] Deobfuscation complete.");
         }
 
         /// <summary>
-        /// Основной алгоритм распутывания: симулирует выполнение, отслеживая константы.
+        /// Символьное выполнение для отслеживания переменных типа num = 1; if (num == 2)...
         /// </summary>
-        private void UnravelControlFlow(MethodDef method)
+        private void UnravelFlowWithSymbolicExecution(MethodDef method)
         {
-            var body = method.Body;
-            if (body == null) return;
-
+            var instructions = method.Body.Instructions;
             bool changed = true;
             int iterations = 0;
             const int MAX_ITERATIONS = 50; // Защита от бесконечного цикла
@@ -77,323 +75,118 @@ namespace Deobfuscator
             {
                 changed = false;
                 iterations++;
+                _knownValues.Clear();
 
-                // Шаг 1: Попытка упростить переходы, основанные на известных константах
-                if (SimplifyConditionalJumps(method))
+                // Проходим по инструкциям, пытаясь вычислить значения
+                for (int i = 0; i < instructions.Count; i++)
                 {
-                    changed = true;
-                    continue; // Перезапуск, так как инструкции изменились
-                }
-
-                // Шаг 2: Удаление цепочек безусловных переходов (goto A -> goto B)
-                if (FlattenGotoChains(method))
-                {
-                    changed = true;
-                    continue;
-                }
-
-                // Шаг 3: Удаление переходов на следующую инструкцию
-                if (RemoveRedundantBranches(method))
-                {
-                    changed = true;
-                }
-            }
-
-            // Финальная очистка: удаление недостижимого кода после того, как поток выпрямлен
-            RemoveUnreachableCode(method);
-            
-            // Важно: сообщаем dnlib, что мы изменили структуру, но хотим сохранить старый MaxStack или пересчитать его корректно
-            body.UpdateInstructionOffsets();
-        }
-
-        /// <summary>
-        /// Упрощает условные переходы, если условие известно на этапе анализа.
-        /// Пример: if (num == 2894.0) где num известно как 2894.0 -> превращается в безусловный переход или удаление.
-        /// </summary>
-        private bool SimplifyConditionalJumps(MethodDef method)
-        {
-            var instructions = method.Body.Instructions;
-            bool modified = false;
-
-            // Сначала соберем информацию о присваиваниях констант
-            // В реальном обфускаторе здесь нужен полноценный анализ потоков данных (Data Flow Analysis)
-            // Для данного примера сделаем упрощенный проход "на лету"
-            
-            // Словарь: Index инструкции -> Известные значения локальных переменных ПОСЛЕ этой инструкции
-            var localStates = new Dictionary<int, Dictionary<int, object?>>(); 
-            
-            // Инициализация пустым состоянием
-            for(int i=0; i<instructions.Count; i++) localStates[i] = new Dictionary<int, object?>();
-
-            // Простой однопроходный анализ для заполнения localStates (очень упрощенно)
-            // В идеале нужно делать фикс-поинт итерации, но для начала попробуем один проход
-            var currentLocals = new Dictionary<int, object?>();
-            for (int i = 0; i < instructions.Count; i++)
-            {
-                var instr = instructions[i];
-                
-                // Сохраняем состояние перед инструкцией
-                foreach(var kvp in currentLocals) localStates[i][kvp.Key] = kvp.Value;
-
-                if (instr.OpCode.Code == Code.Stloc)
-                {
-                    var local = instr.Operand as Local;
-                    if (local != null && i > 0)
+                    var instr = instructions[i];
+                    
+                    // Отслеживание загрузки констант в локальные переменные
+                    if (instr.OpCode.Code == Code.Stloc)
                     {
-                        var prev = instructions[i - 1];
-                        var val = GetConstantValue(prev);
-                        if (val != null)
+                        if (instr.Operand is Local local)
                         {
-                            currentLocals[local.Index] = val;
-                        }
-                        else
-                        {
-                            // Если присваиваем неизвестное значение, сбрасываем знание об этой переменной
-                            if(currentLocals.ContainsKey(local.Index)) currentLocals.Remove(local.Index);
+                            // Смотрим назад, чтобы найти, что было загружено
+                            // В dnlib 4.x нет Previous, ищем по индексу
+                            if (i > 0)
+                            {
+                                var prev = instructions[i - 1];
+                                var val = GetConstantValue(prev);
+                                if (val != null)
+                                {
+                                    _knownValues[local.Index] = val;
+                                }
+                            }
                         }
                     }
-                }
-                else if (instr.OpCode.Code == Code.Stloc_S)
-                {
-                     var local = instr.Operand as Local;
-                     if (local != null && i > 0)
-                     {
-                         var prev = instructions[i - 1];
-                         var val = GetConstantValue(prev);
-                         if (val != null) currentLocals[local.Index] = val;
-                         else if(currentLocals.ContainsKey(local.Index)) currentLocals.Remove(local.Index);
-                     }
-                }
-                // Сброс при ветвлениях (упрощение: считаем, что после goto знания теряются, если не проанализированы пути)
-                if (instr.OpCode.FlowControl == FlowControl.Branch || 
-                    instr.OpCode.FlowControl == FlowControl.Cond_Branch ||
-                    instr.OpCode.FlowControl == FlowControl.Switch)
-                {
-                    // В полной реализации здесь нужно сливать состояния из разных путей
-                    // Сейчас просто очищаем для безопасности, чтобы не сделать ложных оптимизаций
-                    // Но для паттерна "num = X; goto L; L: if (num == X)" это сработает, если анализировать блок линейно
-                }
-            }
-
-            // Теперь проходим и упрощаем условия, используя собранные данные
-            for (int i = 0; i < instructions.Count; i++)
-            {
-                var instr = instructions[i];
-
-                if (instr.OpCode.FlowControl == FlowControl.Cond_Branch)
-                {
-                    // Проверяем, можем ли мы вычислить условие
-                    // Это сложная часть: нужно посмотреть на стек перед этой инструкцией
-                    // Для примера с "num" обычно это: ldloc, ldc, ceq, brtrue
-                    // Найдем последовательность сравнения перед ветвлением
-                    
-                    if (i >= 2)
+                    // Обработка коротких форм stloc.s, stloc.0 и т.д.
+                    else if (instr.OpCode.Code >= Code.Stloc_0 && instr.OpCode.Code <= Code.Stloc_3)
                     {
-                        var cmpInstr = instructions[i - 1]; // Обычно ceq, cgt, clt
-                        var loadVarInstr = instructions[i - 2]; // ldloc
-                        
-                        if (loadVarInstr.OpCode.Code == Code.Ldloc && cmpInstr.OpCode.Code == Code.Ceq)
+                        int localIndex = instr.OpCode.Code - Code.Stloc_0;
+                        if (i > 0)
                         {
-                            var local = loadVarInstr.Operand as Local;
-                            if (local != null && localStates[i].ContainsKey(local.Index))
-                            {
-                                var knownVal = localStates[i][local.Index];
-                                var compareVal = GetConstantValue(cmpInstr.Previous); // Значение, с которым сравниваем (до ceq)
-                                
-                                // Нам нужно найти ldc перед ceq. Структура: ldloc, ldc, ceq, brtrue
-                                if (i >= 3 && instructions[i-3] != null)
-                                {
-                                    var ldcInstr = instructions[i - 3];
-                                    var constToCompare = GetConstantValue(ldcInstr);
+                            var prev = instructions[i - 1];
+                            var val = GetConstantValue(prev);
+                            if (val != null)
+                                _knownValues[localIndex] = val;
+                        }
+                    }
+                    else if (instr.OpCode.Code == Code.Stloc_S)
+                    {
+                        if (instr.Operand is Local localS && i > 0)
+                        {
+                            var prev = instructions[i - 1];
+                            var val = GetConstantValue(prev);
+                            if (val != null)
+                                _knownValues[localS.Index] = val;
+                        }
+                    }
 
-                                    if (knownVal != null && constToCompare != null)
+                    // Упрощение условий: if (num == X)
+                    // Ищем последовательность: ldloc, ldc, ceq, brtrue/brfalse
+                    if (instr.OpCode.FlowControl == FlowControl.Cond_Branch && i >= 3)
+                    {
+                        // Проверяем паттерн: ldloc -> ldc -> ceq -> branch
+                        var opCeq = instructions[i - 1];
+                        var opLdc = instructions[i - 2];
+                        var opLdloc = instructions[i - 3];
+
+                        if (opCeq.OpCode.Code == Code.Ceq && opLdloc.OpCode.Code == Code.Ldloc)
+                        {
+                            int localIdx = -1;
+                            if (opLdloc.Operand is Local l) localIdx = l.Index;
+                            else if (opLdloc.OpCode.Code >= Code.Ldloc_0 && opLdloc.OpCode.Code <= Code.Ldloc_3)
+                                localIdx = opLdloc.OpCode.Code - Code.Ldloc_0;
+                            else if (opLdloc.OpCode.Code == Code.Ldloc_S && opLdloc.Operand is Local ls)
+                                localIdx = ls.Index;
+
+                            if (localIdx != -1 && _knownValues.ContainsKey(localIdx))
+                            {
+                                var knownVal = _knownValues[localIdx];
+                                var compareVal = GetConstantValue(opLdc);
+
+                                if (knownVal != null && compareVal != null)
+                                {
+                                    bool isEqual = knownVal.Equals(compareVal);
+                                    bool isBranchTrue = instr.OpCode.Code == Code.Brtrue || instr.OpCode.Code == Code.Brtrue_S;
+                                    
+                                    // Если условие всегда истинно или ложно, заменяем переход
+                                    bool shouldJump = (isEqual && isBranchTrue) || (!isEqual && !isBranchTrue);
+
+                                    if (shouldJump)
                                     {
-                                        bool result = knownVal.Equals(constToCompare);
-                                        
-                                        // Если условие истинно всегда -> заменяем на безусловный переход (Br)
-                                        // Если ложно всегда -> заменяем на Nop (пропускаем ветку)
-                                        
-                                        if (result)
-                                        {
-                                            // Условие всегда true: превращаем в безусловный goto
-                                            instr.OpCode = OpCodes.Br;
-                                            modified = true;
-                                            Console.WriteLine($"  [+] Simplified TRUE branch at IL_{i:X4}");
-                                        }
-                                        else
-                                        {
-                                            // Условие всегда false: удаляем переход (превращаем в nop, выполнение идет дальше)
-                                            instr.OpCode = OpCodes.Nop;
-                                            instr.Operand = null;
-                                            modified = true;
-                                            Console.WriteLine($"  [+] Removed FALSE branch at IL_{i:X4}");
-                                        }
+                                        // Заменяем условный переход на безусловный к цели
+                                        instr.OpCode = OpCodes.Br;
+                                        changed = true;
+                                        Console.WriteLine($"  [Fix] Resolved conditional jump at IL_{instr.Offset:X4} based on known value.");
+                                    }
+                                    else
+                                    {
+                                        // Условие ложно, превращаем в Nop (не прыгаем)
+                                        instr.OpCode = OpCodes.Nop;
+                                        instr.Operand = null;
+                                        changed = true;
+                                        Console.WriteLine($"  [Fix] Removed false conditional jump at IL_{instr.Offset:X4}.");
                                     }
                                 }
                             }
                         }
                     }
-                }
-            }
-
-            return modified;
-        }
-
-        /// <summary>
-        /// Превращает цепочки goto A -> goto B в прямой goto B
-        /// </summary>
-        private bool FlattenGotoChains(MethodDef method)
-        {
-            var instructions = method.Body.Instructions;
-            bool modified = false;
-
-            foreach (var instr in instructions)
-            {
-                if (instr.OpCode.Code == Code.Br && instr.Operand is Instruction target)
-                {
-                    // Если цель тоже является безусловным переходом
-                    if (target.OpCode.Code == Code.Br && target.Operand is Instruction nextTarget)
-                    {
-                        instr.Operand = nextTarget;
-                        modified = true;
-                    }
-                    // Если цель ведет на следующую инструкцию (бессмысленный прыжок)
-                    else if (target == instr.Next)
-                    {
-                        instr.OpCode = OpCodes.Nop;
-                        instr.Operand = null;
-                        modified = true;
-                    }
-                }
-            }
-            return modified;
-        }
-
-        private bool RemoveRedundantBranches(MethodDef method)
-        {
-            var instructions = method.Body.Instructions;
-            bool modified = false;
-            for (int i = 0; i < instructions.Count; i++)
-            {
-                var instr = instructions[i];
-                if (instr.OpCode.Code == Code.Br && instr.Operand is Instruction target)
-                {
-                    if (target == instr.Next)
-                    {
-                        instr.OpCode = OpCodes.Nop;
-                        instr.Operand = null;
-                        modified = true;
-                    }
-                }
-            }
-            return modified;
-        }
-
-        /// <summary>
-        /// Удаляет инструкции, до которых невозможно добраться (после ret/throw, если туда нет goto)
-        /// </summary>
-        private void RemoveUnreachableCode(MethodDef method)
-        {
-            var instructions = method.Body.Instructions;
-            var reachable = new HashSet<Instruction>();
-            
-            // BFS от первой инструкции
-            var queue = new Queue<Instruction>();
-            if (instructions.Count > 0)
-            {
-                queue.Enqueue(instructions[0]);
-                reachable.Add(instructions[0]);
-            }
-
-            while (queue.Count > 0)
-            {
-                var curr = queue.Dequeue();
-                var nextIdx = instructions.IndexOf(curr) + 1;
-                Instruction nextInstr = nextIdx < instructions.Count ? instructions[nextIdx] : null;
-
-                switch (curr.OpCode.FlowControl)
-                {
-                    case FlowControl.Branch: // unconditional goto
-                        if (curr.Operand is Instruction target)
-                            AddToQueue(queue, reachable, target);
-                        break;
-                    case FlowControl.Cond_Branch: // if
-                        if (curr.Operand is Instruction target)
-                            AddToQueue(queue, reachable, target);
-                        if (nextInstr != null)
-                            AddToQueue(queue, reachable, nextInstr);
-                        break;
-                    case FlowControl.Switch:
-                        if (curr.Operand is Instruction[] targets)
-                            foreach (var t in targets) AddToQueue(queue, reachable, t);
-                        if (nextInstr != null)
-                            AddToQueue(queue, reachable, nextInstr);
-                        break;
-                    case FlowControl.Return:
-                    case FlowControl.Throw:
-                        // Конец пути
-                        break;
-                    default:
-                        // Sequential flow
-                        if (nextInstr != null)
-                            AddToQueue(queue, reachable, nextInstr);
-                        break;
-                }
-            }
-
-            // Заменяем недостижимое на Nop
-            bool changed = false;
-            foreach (var instr in instructions)
-            {
-                if (!reachable.Contains(instr) && instr.OpCode.Code != Code.Nop)
-                {
-                    instr.OpCode = OpCodes.Nop;
-                    instr.Operand = null;
-                    changed = true;
-                }
-            }
-            
-            if (changed) Console.WriteLine("  [+] Removed unreachable code blocks.");
-        }
-
-        private void AddToQueue(Queue<Instruction> q, HashSet<Instruction> set, Instruction instr)
-        {
-            if (!set.Contains(instr))
-            {
-                set.Add(instr);
-                q.Enqueue(instr);
-            }
-        }
-
-        private void CleanupMethod(MethodDef method)
-        {
-            var body = method.Body;
-            if (body == null) return;
-
-            // Удаляем лишние NOP в конце метода
-            for (int i = body.Instructions.Count - 1; i >= 0; i--)
-            {
-                if (body.Instructions[i].OpCode.Code == Code.Nop)
-                {
-                    // Проверка: является ли этот NOP целью какого-либо перехода?
-                    bool isTarget = false;
-                    foreach (var instr in body.Instructions)
-                    {
-                        if (instr.Operand == body.Instructions[i])
-                        {
-                            isTarget = true;
-                            break;
-                        }
-                    }
                     
-                    // Если не цель и стоит после ret/throw (упрощенно) - можно удалить, 
-                    // но dnlib любит, чтобы список был непрерывным. Лучше оставить как Nop, 
-                    // если он не мешает. 
-                    // Здесь мы просто оставляем их как Nop, так как они уже безвредны.
+                    // Обновление известных значений при присваивании внутри блоков
+                    if (instr.OpCode.Code == Code.Ldc_R8 || instr.OpCode.Code == Code.Ldc_I4 || instr.OpCode.Code == Code.Ldc_I8)
+                    {
+                         // Если перед этим было stloc, мы уже обработали выше. 
+                         // Здесь можно добавить логику, если значение используется сразу.
+                    }
+                }
+                
+                if (changed)
+                {
+                    method.Body.UpdateInstructionOffsets();
                 }
             }
-            
-            body.OptimizeMacros();
         }
 
         private object? GetConstantValue(Instruction? instr)
@@ -402,7 +195,8 @@ namespace Deobfuscator
 
             switch (instr.OpCode.Code)
             {
-                case Code.Ldc_I4: return instr.Operand is int i ? i : (instr.Operand is int? ii ? ii : null);
+                case Code.Ldc_I4:
+                    return instr.Operand is int val ? (object)val : null;
                 case Code.Ldc_I4_0: return 0;
                 case Code.Ldc_I4_1: return 1;
                 case Code.Ldc_I4_2: return 2;
@@ -413,31 +207,143 @@ namespace Deobfuscator
                 case Code.Ldc_I4_7: return 7;
                 case Code.Ldc_I4_8: return 8;
                 case Code.Ldc_I4_M1: return -1;
-                case Code.Ldc_R4: return instr.Operand as float?;
-                case Code.Ldc_R8: return instr.Operand as double?;
-                case Code.Ldc_I8: return instr.Operand as long?;
-                default: return null;
+                case Code.Ldc_R4:
+                    return instr.Operand is float f ? (object)f : null;
+                case Code.Ldc_R8:
+                    return instr.Operand is double d ? (object)d : null;
+                case Code.Ldc_I8:
+                    return instr.Operand is long l ? (object)l : null;
+                default:
+                    return null;
             }
         }
 
-        // В dnlib 4.x у Instruction нет свойства Previous. 
-        // Придется искать по индексу, если нужно.
-        // Но в методе SimplifyConditionalJumps выше я использовал индексацию массива, что безопасно.
-        // Если нужно получить предыдущий элемент относительно конкретного instruction в списке:
-        private Instruction? GetPreviousInstruction(IList<Instruction> instructions, Instruction current)
+        /// <summary>
+        /// Упрощение цепочек goto и удаление лишних nop
+        /// </summary>
+        private void SimplifyJumps(MethodDef method)
         {
-            int idx = instructions.IndexOf(current);
-            return idx > 0 ? instructions[idx - 1] : null;
+            var instructions = method.Body.Instructions;
+            bool changed = true;
+
+            while (changed)
+            {
+                changed = false;
+                for (int i = 0; i < instructions.Count; i++)
+                {
+                    var instr = instructions[i];
+
+                    // 1. Удаление цепочек: Br -> Br
+                    if (instr.OpCode.Code == Code.Br && instr.Operand is Instruction target)
+                    {
+                        if (target.OpCode.Code == Code.Br && target.Operand is Instruction nextTarget)
+                        {
+                            instr.Operand = nextTarget;
+                            changed = true;
+                        }
+                    }
+
+                    // 2. Удаление перехода на следующую инструкцию
+                    if (instr.OpCode.Code == Code.Br && instr.Operand is Instruction nextInstr)
+                    {
+                        // Находим индекс текущей инструкции, чтобы проверить следующую
+                        // В dnlib 4.x надежнее искать по индексу списка
+                        if (i + 1 < instructions.Count && nextInstr == instructions[i+1])
+                        {
+                            instr.OpCode = OpCodes.Nop;
+                            instr.Operand = null;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            
+            // Физическое удаление Nop (опционально, лучше оставить для безопасности структуры)
+            // Здесь мы просто очищаем операнды у Nop
         }
 
-        private bool IsObfuscatedName(string name)
+        private void RemoveDeadCode(MethodDef method)
         {
-            if (string.IsNullOrEmpty(name)) return false;
-            // Простая эвристика: имена из одного символа, вопросительные знаки, или бессмысленные наборы
-            if (name.Length == 1 && char.IsLetter(name[0])) return true;
-            if (name.Contains("?") || name.Contains("<")) return true;
-            if (name.StartsWith("Class") || name.StartsWith("GClass") || name.StartsWith("smethod_")) return true;
-            return false;
+            var instructions = method.Body.Instructions;
+            var reachable = new HashSet<Instruction>();
+            
+            // Простой анализ достижимости от начала
+            var queue = new Queue<Instruction>();
+            if (instructions.Count > 0)
+            {
+                queue.Enqueue(instructions[0]);
+                reachable.Add(instructions[0]);
+            }
+
+            while (queue.Count > 0)
+            {
+                var curr = queue.Dequeue();
+                if (curr == null) continue;
+
+                // Если это ветвление
+                if (curr.OpCode.FlowControl == FlowControl.Cond_Branch)
+                {
+                    if (curr.Operand is Instruction target)
+                    {
+                        AddIfNew(target, reachable, queue);
+                    }
+                    // Следующая инструкция тоже достижима
+                    if (curr.Next != null) // Next работает в списке инструкций dnlib при итерации, но надежнее по индексу
+                    {
+                         // В dnlib 4.x Instruction.Next доступен, если список не изменен радикально, 
+                         // но безопаснее использовать индекс. Однако для простоты оставим проверку.
+                         // Если Next null, ищем по индексу
+                         var idx = instructions.IndexOf(curr);
+                         if (idx >= 0 && idx + 1 < instructions.Count)
+                             AddIfNew(instructions[idx+1], reachable, queue);
+                    }
+                }
+                else if (curr.OpCode.Code == Code.Br || curr.OpCode.Code == Code.Switch)
+                {
+                    if (curr.Operand is Instruction brTarget)
+                    {
+                         // Для Switch operand - массив инструкций
+                         if (curr.OpCode.Code == Code.Switch && curr.Operand is Instruction[] targets)
+                         {
+                             foreach(var t in targets) AddIfNew(t, reachable, queue);
+                         }
+                         else
+                         {
+                             AddIfNew(brTarget, reachable, queue);
+                         }
+                    }
+                }
+                else if (curr.OpCode.FlowControl != FlowControl.Ret && 
+                         curr.OpCode.FlowControl != FlowControl.Throw &&
+                         curr.OpCode.FlowControl != FlowControl.Branch) // Branch обычно означает безусловный, обработан выше
+                {
+                    var idx = instructions.IndexOf(curr);
+                    if (idx >= 0 && idx + 1 < instructions.Count)
+                        AddIfNew(instructions[idx+1], reachable, queue);
+                }
+            }
+
+            // Замена недостижимого кода на Nop
+            for (int i = 0; i < instructions.Count; i++)
+            {
+                if (!reachable.Contains(instructions[i]))
+                {
+                    // Не удаляем, а заменяем на Nop, чтобы не сломать оффсеты других переходов до пересчета
+                    if (instructions[i].OpCode.Code != Code.Nop)
+                    {
+                        instructions[i].OpCode = OpCodes.Nop;
+                        instructions[i].Operand = null;
+                    }
+                }
+            }
+        }
+
+        private void AddIfNew(Instruction instr, HashSet<Instruction> set, Queue<Instruction> queue)
+        {
+            if (instr != null && set.Add(instr))
+            {
+                queue.Enqueue(instr);
+            }
         }
 
         private void RenameWithAi(MethodDef method)
@@ -447,19 +353,17 @@ namespace Deobfuscator
             try
             {
                 string ilCode = string.Join("\n", method.Body.Instructions.Take(30).Select(x => x.ToString()));
-                string returnType = method.ReturnType?.ToString() ?? "void";
-                
-                string suggested = _aiAssistant.GetSuggestedName(method.Name, ilCode, returnType);
-                
-                if (!string.IsNullOrEmpty(suggested) && suggested != method.Name && !suggested.Contains("error"))
+                string suggested = _aiAssistant.GetSuggestedName(method.Name, ilCode, method.ReturnType.ToString());
+
+                if (!string.IsNullOrEmpty(suggested) && suggested != method.Name && !suggested.Contains(" "))
                 {
                     method.Name = suggested;
-                    Console.WriteLine($"  [AI] Renamed to: {suggested}");
+                    Console.WriteLine($"[AI] Renamed {method.Name}");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"  [AI] Failed: {ex.Message}");
+                Console.WriteLine($"[AI Error]: {ex.Message}");
             }
         }
 
@@ -479,16 +383,12 @@ namespace Deobfuscator
             try
             {
                 _module.Write(outputPath, options);
-                Console.WriteLine("[+] Successfully saved!");
+                Console.WriteLine("[+] Successfully saved.");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[!] Save error: {ex.Message}");
-                // Попытка спасти ситуацию, записав с еще меньшим количеством проверок
-                Console.WriteLine("[*] Trying fallback save mode...");
-                options.MetadataOptions.Flags |= MetadataFlags.TryToKeepPdbOffsets;
-                _module.Write(outputPath, options);
-                Console.WriteLine("[+] Saved with fallback options.");
+                Console.WriteLine($"[Error] Failed to save: {ex.Message}");
+                throw;
             }
         }
 
