@@ -1,1 +1,1 @@
-Nothing should be ignored based on the provided file changes. The only modified file is a C# source code file (`Deobfuscator/UniversalDeobfuscator.cs`), which is not a build artifact, dependency, or temporary file.
+Nothing should be ignored based on the provided file changes. The only modified file is a source code file (.cs), which should not be added to .gitignore.
