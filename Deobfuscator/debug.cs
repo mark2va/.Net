@@ -121,15 +121,6 @@ namespace Deobfuscator
             // Map: StateValue -> NextStateValue
             var transitions = new Dictionary<object, object?>();
             
-            // Мы будем искать паттерны:
-            // IL_X: ldloc.s V_state
-            // IL_Y: ldc.i4 XXXX (CheckVal)
-            // IL_Z: ceq
-            // IL_K: brtrue.s IL_Target (Start of Payload)
-            // ... Payload ...
-            // IL_N: ldc.i4 YYYY (NextVal)
-            // IL_M: stloc.s V_state
-            
             Log("Building state transition graph...");
 
             for (int i = 0; i < instructions.Count - 4; i++)
@@ -235,7 +226,6 @@ namespace Deobfuscator
             if (startIndex == -1) return block;
 
             int ip = startIndex;
-            // Ограничим размер блока, чтобы не уйти далеко
             int maxBlockLen = 50; 
             int count = 0;
 
@@ -266,7 +256,6 @@ namespace Deobfuscator
                 }
 
                 // Проверка на обновление состояния (конец текущего блока)
-                // Паттерн: ldc.X, stloc.s (state)
                 if (ip + 1 < allInstructions.Count)
                 {
                     var nextIns = allInstructions[ip+1];
@@ -283,9 +272,6 @@ namespace Deobfuscator
                 }
 
                 // Фильтрация мусора внутри блока
-                // Мы хотим убрать оставшиеся проверки, если они есть внутри блока (редко, но бывает)
-                // И оставить только полезную нагрузку
-                
                 bool isJunk = false;
 
                 // Если это ldloc(state) - мусор
@@ -297,7 +283,7 @@ namespace Deobfuscator
                     if (_debugMode) Log($"    Skipped (State Load): {instr}");
                 }
                 
-                // Если это сравнение (ceq, cgt...) - мусор
+                // Если это сравнение - мусор
                 if (!isJunk && (instr.OpCode.Code == Code.Ceq || instr.OpCode.Code == Code.Cgt || instr.OpCode.Code == Code.Clt ||
                     instr.OpCode.Code == Code.Cgt_Un || instr.OpCode.Code == Code.Clt_Un))
                 {
@@ -305,7 +291,7 @@ namespace Deobfuscator
                     if (_debugMode) Log($"    Skipped (Comparison): {instr}");
                 }
 
-                // Если это ветвление - мусор (мы уже обработали логику ветвления при построении графа)
+                // Если это ветвление - мусор
                 if (!isJunk && (instr.OpCode.FlowControl == FlowControl.Cond_Branch || instr.OpCode.FlowControl == FlowControl.Branch))
                 {
                     isJunk = true;
