@@ -10,12 +10,18 @@ namespace Deobfuscator
     public class AiAssistant : IDisposable
     {
         private readonly AiConfig _config;
+        private HttpWebRequest? _currentRequest;
 
         public bool Enabled => _config.Enabled;
 
         public AiAssistant(AiConfig config)
         {
             _config = config;
+            // Убедимся, что URL заканчивается правильно
+            if (!_config.ApiUrl.EndsWith("/")) 
+            {
+                // Для Ollama базовый URL обычно http://localhost:11434, путь добавим в запросе
+            }
         }
 
         public string? GetSuggestedName(string currentName, string methodBodyIl, string returnType)
@@ -24,78 +30,87 @@ namespace Deobfuscator
 
             try
             {
-                // Формируем промпт
-                string prompt = $"Analyze this C# method IL code and suggest a short, meaningful camelCase name. Return ONLY the name.\n" +
-                                $"Context: {returnType}\n" +
-                                $"IL Snippet:\n{methodBodyIl}";
+                string prompt = $"Analyze this C# method IL code and suggest a meaningful name in camelCase. Return ONLY the name, no explanation.\n" +
+                                $"Return type: {returnType}\n" +
+                                $"Current name: {currentName}\n" +
+                                $"IL Code snippet:\n{methodBodyIl}";
 
-                // Подготовка JSON для Ollama / совместимых API
                 var requestBody = new
                 {
                     model = _config.Model,
                     prompt = prompt,
                     stream = false,
-                    options = new { temperature = 0.1, num_predict = 20 }
+                    options = new { temperature = 0.1, num_predict = 50 }
                 };
 
                 string json = JsonConvert.SerializeObject(requestBody);
                 byte[] data = Encoding.UTF8.GetBytes(json);
 
-                // Создаем запрос
-                var request = (HttpWebRequest)WebRequest.Create($"{_config.ApiUrl}/api/generate");
-                request.Method = "POST";
-                request.ContentType = "application/json";
-                request.Timeout = _config.TimeoutSeconds * 1000;
+                // Формируем правильный URL
+                string endpoint = _config.ApiUrl.TrimEnd('/');
+                if (!endpoint.Contains("/api/"))
+                {
+                    endpoint += "/api/generate";
+                }
 
-                using (var stream = request.GetRequestStream())
+                _currentRequest = (HttpWebRequest)WebRequest.Create(endpoint);
+                _currentRequest.Method = "POST";
+                _currentRequest.ContentType = "application/json";
+                _currentRequest.Timeout = _config.TimeoutSeconds * 1000;
+
+                using (var stream = _currentRequest.GetRequestStream())
                 {
                     stream.Write(data, 0, data.Length);
                 }
 
-                HttpWebResponse response;
-                try
+                using (var response = (HttpWebResponse)_currentRequest.GetResponse())
                 {
-                    response = (HttpWebResponse)request.GetResponse();
-                }
-                catch (WebException we)
-                {
-                    if (we.Response != null)
+                    if (response.StatusCode != HttpStatusCode.OK)
                     {
-                        using (var errReader = new StreamReader(we.Response.GetResponseStream()))
-                        {
-                            Console.WriteLine($"[AI HTTP Error]: {we.Status} - {errReader.ReadToEnd()}");
-                        }
+                        Console.WriteLine($"[AI] Server returned status: {response.StatusCode}");
+                        return null;
                     }
-                    else
-                    {
-                        Console.WriteLine($"[AI Network Error]: {we.Message}");
-                    }
-                    return null;
-                }
 
-                using (response)
-                using (var reader = new StreamReader(response.GetResponseStream()))
-                {
-                    string result = reader.ReadToEnd();
-                    var jsonResponse = JObject.Parse(result);
-                    
-                    if (jsonResponse["response"] != null)
+                    using (var reader = new StreamReader(response.GetResponseStream()))
                     {
-                        return jsonResponse["response"].ToString().Trim();
+                        string result = reader.ReadToEnd();
+                        var jsonResponse = JObject.Parse(result);
+                        
+                        // Ollama возвращает поле "response"
+                        if (jsonResponse.TryGetValue("response", out var token))
+                        {
+                            return token.ToString().Trim();
+                        }
+                        return null;
                     }
-                    return null;
                 }
+            }
+            catch (WebException we)
+            {
+                if (we.Response is HttpWebResponse resp)
+                {
+                     Console.WriteLine($"[AI HTTP Error]: {resp.StatusCode} ({resp.StatusDescription})");
+                }
+                else
+                {
+                    Console.WriteLine($"[AI Network Error]: {we.Message}");
+                }
+                return null;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[AI Exception]: {ex.Message}");
+                Console.WriteLine($"[AI Error]: {ex.Message}");
                 return null;
+            }
+            finally
+            {
+                _currentRequest = null;
             }
         }
 
         public void Dispose()
         {
-            // Ресурсы освобождаются автоматически в using блоках
+            _currentRequest?.Abort();
         }
     }
 }
