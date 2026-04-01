@@ -39,7 +39,7 @@ namespace Deobfuscator
             {
                 foreach (var method in type.Methods)
                 {
-                    if (!method.HasBody || !method.Body.IsIL) continue;
+                    if (!method.HasBody || !method.Body.HasInstructions) continue;
 
                     try
                     {
@@ -595,12 +595,12 @@ namespace Deobfuscator
             if (operand is Instruction[] ts) return Instruction.Create(op, ts);
             if (operand is string s) return Instruction.Create(op, s);
             if (operand is int i) return Instruction.Create(op, i);
-            if (operand is long l) return Instruction.Create(op, l);
+            if (operand is long lo) return Instruction.Create(op, lo);
             if (operand is float f) return Instruction.Create(op, f);
             if (operand is double d) return Instruction.Create(op, d);
-            if (operand is ITypeDefOrRef t) return Instruction.Create(op, t);
+            if (operand is ITypeDefOrRef td) return Instruction.Create(op, td);
             if (operand is MethodDef m) return Instruction.Create(op, m);
-            if (operand is FieldDef f) return Instruction.Create(op, f);
+            if (operand is FieldDef fd) return Instruction.Create(op, fd);
             if (operand is MemberRef mr) return Instruction.Create(op, mr);
             return new Instruction(op, operand);
         }
