@@ -214,7 +214,7 @@ namespace Deobfuscator
                 }
 
                 // Начало мертвого кода после ret/throw
-                if (instr.OpCode.FlowControl == FlowControl.Ret || instr.OpCode.FlowControl == FlowControl.Throw)
+                if (instr.OpCode.FlowControl == FlowControl.Return || instr.OpCode.FlowControl == FlowControl.Throw)
                 {
                     deadCodeStarted = true;
                 }
