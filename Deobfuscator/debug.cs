@@ -25,13 +25,19 @@ namespace Deobfuscator
             
             if (_debugMode)
             {
-                // Лог будет создан при сохранении или в начале работы, если путь известен
-                // Но пока мы не знаем выходной путь, будем писать в консоль или временный буфер
-                // Для простоты, создадим лог рядом с входным файлом или в текущей папке
-                var dir = Path.GetDirectoryName(filePath) ?? Directory.GetCurrentDirectory();
-                _logFilePath = Path.Combine(dir, "deobfuscator_log.txt");
-                _logWriter = new StreamWriter(_logFilePath, false); // Перезаписываем лог
-                _logWriter.AutoFlush = true;
+                string dir = Path.GetDirectoryName(filePath) ?? ".";
+                string fileName = Path.GetFileNameWithoutExtension(filePath);
+                _logFilePath = Path.Combine(dir, $"{fileName}_deob_log.txt");
+                try 
+                {
+                    _logWriter = new StreamWriter(_logFilePath, false);
+                    _logWriter.AutoFlush = true;
+                    Log("Logger initialized.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[!] Failed to create log file: {ex.Message}");
+                }
             }
         }
 
@@ -39,9 +45,9 @@ namespace Deobfuscator
         {
             if (!_debugMode) return;
             string indent = new string(' ', _indentLevel * 2);
-            string logLine = $"[DEBUG] {indent}{message}";
-            Console.WriteLine(logLine);
-            _logWriter?.WriteLine(logLine);
+            string fullMsg = $"[DEBUG] {indent}{message}";
+            Console.WriteLine(fullMsg);
+            _logWriter?.WriteLine(fullMsg);
         }
 
         public void Deobfuscate()
@@ -65,10 +71,12 @@ namespace Deobfuscator
                             _indentLevel++;
                         }
 
-                        if (UnpackStateMachine(method))
+                        bool unpacked = UnpackStateMachine(method);
+                        
+                        if (unpacked)
                         {
+                            FixStackIssues(method); // Чистим висячие константы
                             CleanupNops(method);
-                            FixStackIssues(method); // Дополнительная фиксация проблем со стеком
                             count++;
                             if (_debugMode) Log("State machine unpacked successfully.");
                         }
@@ -76,8 +84,8 @@ namespace Deobfuscator
                         {
                             if (_debugMode) Log("Not a state machine or unpacking failed. Trying simplification.");
                             SimplifyConditions(method);
-                            CleanupNops(method);
                             FixStackIssues(method);
+                            CleanupNops(method);
                         }
 
                         if (_aiAssistant != null && IsObfuscatedName(method.Name))
@@ -99,68 +107,6 @@ namespace Deobfuscator
             Log("=== Deobfuscation Finished ===");
         }
 
-        /// <summary>
-        /// Исправляет проблемы со стеком: удаляет инструкции, оставляющие значения на стеке без использования.
-        /// </summary>
-        private void FixStackIssues(MethodDef method)
-        {
-            var body = method.Body;
-            if (body == null) return;
-            var instructions = body.Instructions;
-            
-            bool changed = true;
-            while (changed)
-            {
-                changed = false;
-                // Проходим с конца, чтобы безопасно удалять
-                for (int i = instructions.Count - 1; i >= 0; i--)
-                {
-                    var instr = instructions[i];
-                    
-                    // Если это ldc (загрузка константы) и следующая инструкция не использует стек (или это конец блока/метода)
-                    if (instr.OpCode.Code == Code.Ldc_I4 || instr.OpCode.Code == Code.Ldc_I8 || 
-                        instr.OpCode.Code == Code.Ldc_R4 || instr.OpCode.Code == Code.Ldc_R8)
-                    {
-                        bool isUsed = false;
-                        
-                        // Смотрим вперед: если следующая инструкция потребляет значение (Pop1, Pop1_pop1 и т.д.)
-                        if (i + 1 < instructions.Count)
-                        {
-                            var next = instructions[i+1];
-                            var pops = next.OpCode.StackBehaviourPop;
-                            if (pops == StackBehaviour.Pop1 || pops == StackBehaviour.Pop1_pop1 || 
-                                pops == StackBehaviour.Pop1_pop1_pop1 || pops == StackBehaviour.PopAll)
-                            {
-                                isUsed = true;
-                            }
-                            // Особый случай: если следующая инструкция - stloc, starg, call и т.д., которые тоже потребляют
-                            if (next.OpCode.Code == Code.Stloc || next.OpCode.Code == Code.Stloc_S || 
-                                next.OpCode.Code == Code.Starg || next.OpCode.Code == Code.Starg_S ||
-                                next.OpCode.Code == Code.Call || next.OpCode.Code == Code.Callvirt ||
-                                next.OpCode.Code == Code.Newobj || next.OpCode.Code == Code.Box)
-                            {
-                                isUsed = true;
-                            }
-                        }
-                        else
-                        {
-                            // Если это последняя инструкция перед ret или концом метода, и она ldc - это мусор
-                            // Проверим, не является ли она частью возврата (но ldc сам по себе не возвращает)
-                            isUsed = false;
-                        }
-
-                        if (!isUsed)
-                        {
-                            Log($"  [FixStack] Removing unused constant: {instr}");
-                            instructions.RemoveAt(i);
-                            changed = true;
-                        }
-                    }
-                }
-            }
-            body.UpdateInstructionOffsets();
-        }
-
         private bool UnpackStateMachine(MethodDef method)
         {
             var body = method.Body;
@@ -170,10 +116,11 @@ namespace Deobfuscator
             
             Log($"Analyzing {instructions.Count} instructions.");
 
+            // 1. Поиск переменной состояния
             int stateVarIndex = -1;
             object? initialState = null;
 
-            for (int i = 0; i < Math.Min(10, instructions.Count - 1); i++)
+            for (int i = 0; i < Math.Min(15, instructions.Count - 1); i++)
             {
                 if (IsStloc(instructions[i + 1], out int idx))
                 {
@@ -194,6 +141,7 @@ namespace Deobfuscator
                 return false;
             }
 
+            // 2. Построение графа состояний
             var stateBlocks = new Dictionary<object, List<Instruction>>();
             var transitions = new Dictionary<object, object?>();
             
@@ -223,16 +171,15 @@ namespace Deobfuscator
                         {
                             stateBlocks[checkVal] = block;
                             transitions[checkVal] = nextVal;
-                            Log($"  Extracted block for state {checkVal}. Next state: {nextVal ?? "null"}");
-                            Log($"  Block instructions count: {block.Count}");
+                            Log($"  Extracted block for state {checkVal}. Next state: {nextVal ?? "null"}. Instructions: {block.Count}");
+                            
                             if (_debugMode && block.Count > 0)
                             {
                                 _indentLevel++;
-                                foreach(var ins in block.Take(5))
+                                foreach(var ins in block)
                                 {
                                     Log($"    {ins}");
                                 }
-                                if (block.Count > 5) Log($"    ... and {block.Count - 5} more");
                                 _indentLevel--;
                             }
                         }
@@ -246,6 +193,7 @@ namespace Deobfuscator
                 return false;
             }
 
+            // 3. Сборка линейного кода
             var finalInstructions = new List<Instruction>();
             var visited = new HashSet<object?>();
             var queue = new Queue<object?>();
@@ -287,32 +235,6 @@ namespace Deobfuscator
             }
 
             Log($"Final instruction count: {finalInstructions.Count}");
-            
-            // Финальная проверка: убедимся, что метод заканчивается корректно (ret или branch)
-            // Если последняя инструкция не завершает поток, возможно, мы потеряли ret при экстракции
-            var lastIns = finalInstructions.LastOrDefault();
-            if (lastIns != null && lastIns.OpCode.FlowControl != FlowControl.Return && 
-                lastIns.OpCode.FlowControl != FlowControl.Branch && lastIns.OpCode.FlowControl != FlowControl.Throw)
-            {
-                // Ищем оригинальный ret в методе и добавляем его, если его нет
-                if (!finalInstructions.Any(i => i.OpCode.Code == Code.Ret))
-                {
-                     // Пытаемся найти ret в оригинальных инструкциях
-                     var originalRet = instructions.FirstOrDefault(i => i.OpCode.Code == Code.Ret);
-                     if (originalRet != null)
-                     {
-                         Log("Adding missing 'ret' instruction.");
-                         finalInstructions.Add(Instruction.Create(OpCodes.Ret));
-                     }
-                     else if (method.ReturnType.FullName == "System.Void")
-                     {
-                         // Для void методов можно добавить ret явно, если его нет
-                         Log("Adding explicit 'ret' instruction for void method.");
-                         finalInstructions.Add(Instruction.Create(OpCodes.Ret));
-                     }
-                }
-            }
-
             ReplaceMethodBody(method, finalInstructions);
             return true;
         }
@@ -326,7 +248,7 @@ namespace Deobfuscator
             if (startIndex == -1) return block;
 
             int ip = startIndex;
-            int maxBlockLen = 50; 
+            int maxBlockLen = 100; 
             int count = 0;
 
             while (ip < allInstructions.Count && count < maxBlockLen)
@@ -334,26 +256,8 @@ namespace Deobfuscator
                 var instr = allInstructions[ip];
                 count++;
 
-                if (instr.OpCode.FlowControl == FlowControl.Branch)
-                {
-                    if (instr.Operand is Instruction t)
-                    {
-                        int tIdx = allInstructions.IndexOf(t);
-                        if (tIdx > ip) 
-                        {
-                            Log($"    End of block at {instr.Offset} (branch forward to {t.Offset})");
-                            break; 
-                        }
-                    }
-                }
-                
-                if (instr.OpCode.FlowControl == FlowControl.Return)
-                {
-                    block.Add(CloneInstruction(instr));
-                    Log($"    Added (Ret): {instr}");
-                    break;
-                }
-
+                // Проверка на обновление состояния (конец текущего блока)
+                // Паттерн: ldc.X, stloc.s (state)
                 if (ip + 1 < allInstructions.Count)
                 {
                     var nextIns = allInstructions[ip+1];
@@ -363,14 +267,38 @@ namespace Deobfuscator
                         if (val != null)
                         {
                             nextState = val;
-                            Log($"    Found state update: state = {val}. Ending block.");
-                            break;
+                            Log($"    [End Block] Found state update: state = {val}");
+                            break; 
                         }
                     }
                 }
 
+                // Проверка на безусловный переход вперед (конец блока)
+                if (instr.OpCode.FlowControl == FlowControl.Branch)
+                {
+                    if (instr.Operand is Instruction t)
+                    {
+                        int tIdx = allInstructions.IndexOf(t);
+                        if (tIdx > ip) 
+                        {
+                            Log($"    [End Block] Branch forward to {t.Offset}");
+                            break; 
+                        }
+                    }
+                }
+                
+                // Возврат
+                if (instr.OpCode.FlowControl == FlowControl.Return)
+                {
+                    block.Add(CloneInstruction(instr));
+                    Log($"    [End Block] Return: {instr}");
+                    break;
+                }
+
+                // ФИЛЬТРАЦИЯ ТОЛЬКО СЛУЖЕБНЫХ ИНСТРУКЦИЙ АВТОМАТА
                 bool isJunk = false;
 
+                // 1. Загрузка переменной состояния
                 if (GetLocalIndex(instr) == stateVarIndex && 
                    (instr.OpCode.Code == Code.Ldloc || instr.OpCode.Code == Code.Ldloc_S ||
                     (instr.OpCode.Code >= Code.Ldloc_0 && instr.OpCode.Code <= Code.Ldloc_3)))
@@ -379,6 +307,7 @@ namespace Deobfuscator
                     if (_debugMode) Log($"    Skipped (State Load): {instr}");
                 }
                 
+                // 2. Сравнения (ceq, cgt...) - они были частью условия перехода
                 if (!isJunk && (instr.OpCode.Code == Code.Ceq || instr.OpCode.Code == Code.Cgt || instr.OpCode.Code == Code.Clt ||
                     instr.OpCode.Code == Code.Cgt_Un || instr.OpCode.Code == Code.Clt_Un))
                 {
@@ -386,6 +315,7 @@ namespace Deobfuscator
                     if (_debugMode) Log($"    Skipped (Comparison): {instr}");
                 }
 
+                // 3. Ветвления (условные и безусловные) - логика уже учтена
                 if (!isJunk && (instr.OpCode.FlowControl == FlowControl.Cond_Branch || instr.OpCode.FlowControl == FlowControl.Branch))
                 {
                     isJunk = true;
@@ -402,6 +332,55 @@ namespace Deobfuscator
             }
 
             return block;
+        }
+
+        /// <summary>
+        /// Удаляет инструкции, оставляющие мусор на стеке (например, голые ldc перед ret).
+        /// </summary>
+        private void FixStackIssues(MethodDef method)
+        {
+            var body = method.Body;
+            if (body == null) return;
+            var instrs = body.Instructions;
+            
+            bool changed = true;
+            while (changed)
+            {
+                changed = false;
+                // Простой анализ: если инструкция пушит значение, а следующая её не потребляет и это не конец метода
+                for (int i = 0; i < instrs.Count - 1; i++)
+                {
+                    var curr = instrs[i];
+                    var next = instrs[i+1];
+
+                    if (curr.OpCode.StackBehaviourPush == StackBehaviour.Push1)
+                    {
+                        bool consumed = false;
+                        if (next.OpCode.StackBehaviourPop == StackBehaviour.Pop1 || 
+                            next.OpCode.StackBehaviourPop == StackBehaviour.Pop1_pop1 ||
+                            next.OpCode.StackBehaviourPop == StackBehaviour.Pop1_pop1_pop1 ||
+                            next.OpCode.StackBehaviourPop == StackBehaviour.Varpop)
+                        {
+                            consumed = true;
+                        }
+                        
+                        // Если следующая инструкция тоже пушит (значит предыдущее значение потеряно)
+                        if (!consumed && next.OpCode.StackBehaviourPush == StackBehaviour.Push1)
+                        {
+                             // Проверяем, не является ли curr константой, а next тоже константой или ret
+                             if ((curr.OpCode.Code == Code.Ldc_I4 || curr.OpCode.Code == Code.Ldc_R8 || curr.OpCode.Code == Code.Ldc_I8) &&
+                                 (next.OpCode.Code == Code.Ldc_I4 || next.OpCode.Code == Code.Ldc_R8 || next.OpCode.Code == Code.Ldc_I8 || next.OpCode.Code == Code.Ret))
+                             {
+                                 Log($"Removing dead stack value: {curr}");
+                                 instrs.RemoveAt(i);
+                                 changed = true;
+                                 break;
+                             }
+                        }
+                    }
+                }
+            }
+            body.UpdateInstructionOffsets();
         }
 
         private void SimplifyConditions(MethodDef method)
@@ -653,7 +632,6 @@ namespace Deobfuscator
                 {
                     m.Name = newName;
                     Console.WriteLine($"[AI] Renamed {m.Name}");
-                    Log($"[AI] Renamed {m.Name}");
                 }
             } catch { }
         }
@@ -712,10 +690,8 @@ namespace Deobfuscator
             Log("Module saved successfully.");
             
             _logWriter?.Close();
-            if (_debugMode && !string.IsNullOrEmpty(_logFilePath))
-            {
-                Console.WriteLine($"[+] Debug log saved to: {_logFilePath}");
-            }
+            if (_debugMode && _logFilePath != null)
+                Console.WriteLine($"[+] Log saved to: {_logFilePath}");
         }
 
         public void Dispose()
