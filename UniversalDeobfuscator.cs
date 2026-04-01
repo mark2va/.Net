@@ -16,10 +16,8 @@ namespace Deobfuscator
 
         public UniversalDeobfuscator(string filePath, AiConfig aiConfig)
         {
-            // Включаем режим игнорирования ошибок MaxStack при загрузке, если нужно
-            var ctx = ModuleCreationContext.Create(filePath);
-            _module = ModuleDefMD.Load(filePath, ctx);
-            
+            // Загрузка модуля без лишнего контекста
+            _module = ModuleDefMD.Load(filePath);
             _aiAssistant = aiConfig.Enabled ? new AiAssistant(aiConfig) : null;
         }
 
@@ -31,40 +29,34 @@ namespace Deobfuscator
             {
                 foreach (var method in type.Methods)
                 {
-                    if (!method.HasBody || !method.Body.HasInstructions) continue;
+                    // Проверка на наличие тела метода и инструкций
+                    if (method.Body == null || !method.Body.HasInstructions) 
+                        continue;
 
-                    // Пропускаем методы без IL (например, P/Invoke)
-                    if (!method.Body.IsIL) continue;
+                    Console.WriteLine($"[*] Processing: {method.FullName}");
+                    
+                    // ВАЖНО: Отключаем пересчет MaxStack для обфусцированных методов
+                    method.Body.KeepOldMaxStack = true;
 
-                    try 
+                    // 1. Сбор констант
+                    AnalyzeConstants(method);
+
+                    // 2. Упрощение условий
+                    SimplifyConstantConditions(method);
+
+                    // 3. Распутывание потоков (Goto, циклы)
+                    UnravelControlFlow(method);
+
+                    // 4. Удаление мертвого кода
+                    RemoveDeadCode(method);
+
+                    // Обновляем оффсеты после изменений инструкций
+                    method.Body.UpdateInstructionOffsets();
+
+                    // 5. AI Переименование (если включено)
+                    if (_aiAssistant != null && method.Name.StartsWith("<"))
                     {
-                        Console.WriteLine($"[*] Processing: {method.FullName}");
-                        
-                        // 1. Сбор констант
-                        AnalyzeConstants(method);
-
-                        // 2. Упрощение условий
-                        SimplifyConstantConditions(method);
-
-                        // 3. Распутывание потоков (Goto, циклы)
-                        UnravelControlFlow(method);
-
-                        // 4. Удаление мертвого кода
-                        RemoveDeadCode(method);
-
-                        // ВАЖНО: После изменений сбрасываем флаг, чтобы dnlib пересчитал стек корректно
-                        // Но если метод сильно обфусцирован, лучше оставить старый стек
-                        method.Body.KeepOldMaxStack = true; 
-
-                        // 5. AI Переименование (если включено)
-                        if (_aiAssistant != null && method.Name.StartsWith("<"))
-                        {
-                            RenameWithAi(method);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"[!] Error in method {method.FullName}: {ex.Message}");
+                        RenameWithAi(method);
                     }
                 }
             }
@@ -80,16 +72,14 @@ namespace Deobfuscator
             for (int i = 0; i < instructions.Count; i++)
             {
                 var instr = instructions[i];
-                
+                Code code = instr.OpCode.Code;
+
                 // Обработка всех видов Stloc
                 Local? local = null;
-                if (instr.OpCode.Code == Code.Stloc && instr.Operand is Local l) local = l;
-                else if (instr.OpCode.Code == Code.Stloc_S && instr.Operand is Local ls) local = ls;
-                else if (instr.OpCode.Code >= Code.Stloc_0 && instr.OpCode.Code <= Code.Stloc_3)
-                {
-                    int idx = instr.OpCode.Code - Code.Stloc_0;
-                    if (idx < method.Body.Variables.Count) local = method.Body.Variables[idx];
-                }
+                if (code == Code.Stloc && instr.Operand is Local l) local = l;
+                else if (code == Code.Stloc_S && instr.Operand is Local ls) local = ls;
+                else if (code >= Code.Stloc_0 && code <= Code.Stloc_3) 
+                    local = method.Body.Variables[code - Code.Stloc_0];
 
                 if (local != null && i > 0)
                 {
@@ -110,6 +100,7 @@ namespace Deobfuscator
                 case Code.Ldc_I4:
                     if (instr.Operand is int) return (int)instr.Operand;
                     return null;
+
                 case Code.Ldc_I4_0: return 0;
                 case Code.Ldc_I4_1: return 1;
                 case Code.Ldc_I4_2: return 2;
@@ -120,15 +111,19 @@ namespace Deobfuscator
                 case Code.Ldc_I4_7: return 7;
                 case Code.Ldc_I4_8: return 8;
                 case Code.Ldc_I4_M1: return -1;
+
                 case Code.Ldc_R4:
                     if (instr.Operand is float) return (float)instr.Operand;
                     return null;
+
                 case Code.Ldc_R8:
                     if (instr.Operand is double) return (double)instr.Operand;
                     return null;
+
                 case Code.Ldc_I8:
                     if (instr.Operand is long) return (long)instr.Operand;
                     return null;
+
                 default:
                     return null;
             }
@@ -136,8 +131,8 @@ namespace Deobfuscator
 
         private void SimplifyConstantConditions(MethodDef method)
         {
-            // Заглушка для будущей реализации сложной логики
-            // Сейчас просто оставляем как есть, чтобы не ломать стек
+            // Заглушка для будущей логики упрощения условий
+            // Реализация требует сложного анализа стека
         }
 
         private void UnravelControlFlow(MethodDef method)
@@ -148,14 +143,12 @@ namespace Deobfuscator
             while (changed)
             {
                 changed = false;
-                // Пересоздаем список инструкций для безопасной итерации, если нужно, 
-                // но здесь мы работаем по индексу, что безопасно при замене Nop
-                
+                // Пересоздаем список для безопасной итерации при изменениях
                 for (int i = 0; i < instructions.Count; i++)
                 {
                     var instr = instructions[i];
 
-                    // 1. Удаление цепочек goto: goto L1; L1: goto L2; -> goto L2;
+                    // Удаление цепочек goto: goto L1; L1: goto L2; -> goto L2;
                     if (instr.OpCode.Code == Code.Br && instr.Operand is Instruction target)
                     {
                         if (target.OpCode.Code == Code.Br && target.Operand is Instruction nextTarget)
@@ -165,14 +158,11 @@ namespace Deobfuscator
                         }
                     }
                     
-                    // 2. Удаление безусловных переходов на следующую инструкцию
-                    // Проверяем, является ли цель следующей инструкцией в списке
+                    // Удаление безусловных переходов на следующую инструкцию
                     if (instr.OpCode.Code == Code.Br && instr.Operand is Instruction nextInstr)
                     {
-                        int currentIndex = instructions.IndexOf(instr);
-                        int targetIndex = instructions.IndexOf(nextInstr);
-                        
-                        if (targetIndex == currentIndex + 1)
+                        // Проверяем, является ли целевая инструкция следующей по порядку
+                        if (i + 1 < instructions.Count && instructions[i+1] == nextInstr)
                         {
                             instr.OpCode = OpCodes.Nop;
                             instr.Operand = null;
@@ -181,45 +171,26 @@ namespace Deobfuscator
                     }
                 }
             }
-            
-            // Удаляем лишние Nop в конце метода, если они не являются целями ветвлений
-            CleanupNops(method);
-        }
-
-        private void CleanupNops(MethodDef method)
-        {
-            var instructions = method.Body.Instructions;
-            // Простая очистка: если Nop не является целью ветвления, можно удалить (заменить на пустоту позже)
-            // Для безопасности пока просто оставляем, dnlib сам сожмет их при оптимизации, 
-            // если не стоит KeepOldMaxStack. Но мы его поставили.
         }
 
         private void RemoveDeadCode(MethodDef method)
         {
             var instructions = method.Body.Instructions;
-            bool foundTerminal = false;
-
-            // Идем с конца к началу
             for (int i = instructions.Count - 1; i >= 0; i--)
             {
                 var instr = instructions[i];
-
-                if (foundTerminal)
+                if (instr.OpCode.FlowControl == FlowControl.Ret || instr.OpCode.FlowControl == FlowControl.Throw)
                 {
-                    // Если инструкция недостижима (после ret/throw) и не является целью ветвления
-                    if (!IsBranchTarget(instr, instructions))
+                    // Удаляем все инструкции после, если они не являются целевыми точками ветвлений
+                    for (int j = i + 1; j < instructions.Count; j++)
                     {
-                        instr.OpCode = OpCodes.Nop;
-                        instr.Operand = null;
+                        if (!IsBranchTarget(instructions[j], instructions))
+                        {
+                            instructions[j].OpCode = OpCodes.Nop;
+                            instructions[j].Operand = null;
+                        }
                     }
-                }
-                else
-                {
-                    if (instr.OpCode.FlowControl == FlowControl.Ret || 
-                        instr.OpCode.FlowControl == FlowControl.Throw)
-                    {
-                        foundTerminal = true;
-                    }
+                    break; 
                 }
             }
         }
@@ -228,13 +199,8 @@ namespace Deobfuscator
         {
             foreach (var i in all)
             {
-                if (i.Operand == instr) return true;
-                
-                // Проверка для Switch
-                if (i.OpCode.Code == Code.Switch && i.Operand is Instruction[] targets)
-                {
-                    if (targets.Contains(instr)) return true;
-                }
+                if (i.Operand == instr && (i.OpCode.FlowControl == FlowControl.Cond_Branch || i.OpCode.Code == Code.Br || i.OpCode.Code == Code.Switch))
+                    return true;
             }
             return false;
         }
@@ -251,7 +217,7 @@ namespace Deobfuscator
                 if (!string.IsNullOrEmpty(suggested) && suggested != method.Name)
                 {
                     method.Name = suggested;
-                    Console.WriteLine(" [AI] Renamed to: " + suggested);
+                    Console.WriteLine($"[AI] Renamed to: {suggested}");
                 }
             }
             catch { }
@@ -259,28 +225,32 @@ namespace Deobfuscator
 
         public void Save(string outputPath)
         {
-            try
+            Console.WriteLine($"[*] Saving to: {outputPath}");
+            
+            // Настройка опций записи для игнорирования ошибок стека
+            var options = new ModuleWriterOptions(_module)
             {
-                var options = new ModuleWriterOptions(_module)
+                Logger = DummyLogger.NoThrowInstance,
+                MetadataOptions = new MetadataOptions
                 {
-                    Logger = DummyLogger.NoThrowInstance, // Игнорируем предупреждения
-                    MetadataOptions = new MetadataOptions
-                    {
-                        Flags = MetadataFlags.PreserveAll | MetadataFlags.KeepOldMaxStack
-                    }
-                };
-                
-                // Явно разрешаем запись даже с потенциальными ошибками стека
-                options.MetadataOptions.Flags |= MetadataFlags.KeepOldMaxStack;
+                    // Сохраняем старый MaxStack и игнорируем некоторые ошибки валидации
+                    Flags = MetadataFlags.KeepOldMaxStack
+                },
+                // Если метод имеет неправильный стек, мы уже установили KeepOldMaxStack в теле метода,
+                // но эта настройка добавляет страховку на уровне модуля
+            };
 
-                Console.WriteLine("[*] Saving module...");
+            try 
+            {
                 _module.Write(outputPath, options);
-                Console.WriteLine("[+] Saved to: " + outputPath);
+                Console.WriteLine($"[+] Saved successfully!");
             }
             catch (Exception ex)
             {
-                Console.WriteLine("[!] Fatal Error during save: " + ex.Message);
-                throw;
+                Console.WriteLine($"[!] Error saving: {ex.Message}");
+                // Попытка сохранения с минимальными проверками
+                Console.WriteLine("[*] Trying fallback save...");
+                _module.Write(outputPath);
             }
         }
 
