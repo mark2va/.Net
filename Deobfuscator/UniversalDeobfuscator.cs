@@ -109,11 +109,15 @@ namespace Deobfuscator
         private object? GetConstantValue(Instruction? instr)
         {
             if (instr == null) return null;
-
+        
             switch (instr.OpCode.Code)
             {
                 case Code.Ldc_I4:
-                    return instr.Operand is int i ? i : (instr.Operand is int? ii ? ii : null);
+                    // Классическая проверка типа и приведение
+                    if (instr.Operand is int)
+                        return (int)instr.Operand;
+                    return null;
+        
                 case Code.Ldc_I4_0: return 0;
                 case Code.Ldc_I4_1: return 1;
                 case Code.Ldc_I4_2: return 2;
@@ -124,10 +128,24 @@ namespace Deobfuscator
                 case Code.Ldc_I4_7: return 7;
                 case Code.Ldc_I4_8: return 8;
                 case Code.Ldc_I4_M1: return -1;
-                case Code.Ldc_R4: return instr.Operand as float?;
-                case Code.Ldc_R8: return instr.Operand as double?;
-                case Code.Ldc_I8: return instr.Operand as long?;
-                default: return null;
+        
+                case Code.Ldc_R4:
+                    if (instr.Operand is float)
+                        return (float)instr.Operand;
+                    return null;
+        
+                case Code.Ldc_R8:
+                    if (instr.Operand is double)
+                        return (double)instr.Operand;
+                    return null;
+        
+                case Code.Ldc_I8:
+                    if (instr.Operand is long)
+                        return (long)instr.Operand;
+                    return null;
+        
+                default:
+                    return null;
             }
         }
 
