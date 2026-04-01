@@ -600,6 +600,34 @@ namespace Deobfuscator
             if (orig.Operand is double d)
                 return Instruction.Create(orig.OpCode, d);
             
+            if (orig.Operand is byte b)
+                return Instruction.Create(orig.OpCode, b);
+            
+            if (orig.Operand is short s16)
+                return Instruction.Create(orig.OpCode, s16);
+            
+            if (orig.Operand is ushort us16)
+                return Instruction.Create(orig.OpCode, us16);
+            
+            if (orig.Operand is uint ui)
+                return Instruction.Create(orig.OpCode, ui);
+            
+            if (orig.Operand is ulong ul)
+                return Instruction.Create(orig.OpCode, ul);
+            
+            if (orig.Operand is IMethod methodRef)
+                return Instruction.Create(orig.OpCode, methodRef);
+            
+            if (orig.Operand is IField fieldRef)
+                return Instruction.Create(orig.OpCode, fieldRef);
+            
+            if (orig.Operand is IType typeRef)
+                return Instruction.Create(orig.OpCode, typeRef);
+            
+            if (orig.Operand is Token token)
+                return Instruction.Create(orig.OpCode, token);
+            
+            // Fallback: пытаемся использовать operand как есть
             return Instruction.Create(orig.OpCode, orig.Operand);
         }
 
