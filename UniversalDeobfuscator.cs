@@ -18,8 +18,8 @@ namespace Deobfuscator
 
         public UniversalDeobfuscator(string filePath, AiConfig aiConfig)
         {
-            var context = ModuleCreationContext.Create(ModuleCreationOptions.TryToLoadPdbFromDisk);
-            _module = ModuleDefMD.Load(filePath, context);
+            // В dnlib 4.x загружаем напрямую без контекста, если не нужны сложные опции PDB
+            _module = ModuleDefMD.Load(filePath);
             _aiAssistant = aiConfig.Enabled ? new AiAssistant(aiConfig) : null;
         }
 
@@ -32,11 +32,8 @@ namespace Deobfuscator
             {
                 foreach (var method in type.Methods)
                 {
-                    if (!method.HasBody || !method.Body.HasInstructions) continue;
+                    if (!method.HasBody || method.Body == null || !method.Body.HasInstructions) continue;
                     
-                    // Пропускаем методы без IL кода
-                    if (!method.Body.IsIL) continue;
-
                     methodsCount++;
                     Console.WriteLine($"[*] Processing: {method.FullName}");
 
@@ -70,6 +67,8 @@ namespace Deobfuscator
         private void SymbolicExecution(MethodDef method)
         {
             var body = method.Body;
+            if (body == null) return;
+            
             var instructions = body.Instructions;
             bool changed = true;
             int iterations = 0;
@@ -133,41 +132,29 @@ namespace Deobfuscator
         private bool TrySimplifyComparison(Instruction instr, int localIndex, object? knownValue, 
             IList<Instruction> instructions, int currentIndex, ref bool changed)
         {
-            // Проверяем, является ли инструкция сравнением (ceq, bgt, beq и т.д.)
-            // В dnlib сравнение часто выглядит как: ldloc, ldc, ceq или ldloc, ldc, bgt
-            
-            // Упрощенная логика: если мы видим ветвление, зависящее от известной константы
+            // Проверяем, является ли инструкция сравнением или ветвлением
             if (instr.OpCode.FlowControl == FlowControl.Cond_Branch)
             {
-                // Это сложная часть: нужно анализировать стек. 
-                // Для простоты предположим, что если мы только что записали константу в переменную,
-                // а дальше идет проверка этой переменной на равенство с другой константой.
-                
-                // Пример: stloc.0 (val=5), ldloc.0, ldc.i4 5, ceq, brtrue
-                // Мы уже знаем, что loc.0 == 5.
-                
                 // Попытка найти паттерн: ldloc (наша переменная), ldc (константа), branch
-                if (currentIndex + 2 < instructions.Count)
+                // В dnlib мы не можем легко посмотреть назад без индекса, но мы знаем currentIndex.
+                // Обычно перед ветвлением идет ceq, cgt, clt или само ветвление с операндами в стеке.
+                
+                // Упрощение: если ветвление ведет на ту же инструкцию (бесконечный цикл) или на следующую
+                if (instr.Operand is Instruction target)
                 {
-                    var ldlocInstr = instructions[currentIndex]; // Часто само условие начинается с загрузки
-                    // Но в нашем цикле мы стоим на инструкции сравнения/ветвления.
-                    // Нам нужно посмотреть НАЗАД, но у нас нет .Previous.
-                    // Поэтому эта функция вызывается в контексте, где мы уже проанализировали поток.
+                    int targetIndex = instructions.IndexOf(target);
                     
-                    // Альтернативный подход: замена самого условия на безусловный переход или nop
-                    // Если известно, что условие ВСЕГДА истинно или ложно.
-                    
-                    // Пока реализуем простую замену: если ветвление ведет на ту же инструкцию (бесконечный цикл) или на nop
-                    if (instr.Operand is Instruction target)
+                    // Ветвление на следующую инструкцию (бессмысленно) -> удаляем
+                    if (targetIndex == currentIndex + 1)
                     {
-                        if (target == instructions[currentIndex + 1]) // Ветвление на следующую (бессмысленно)
-                        {
-                            instr.OpCode = OpCodes.Nop;
-                            instr.Operand = null;
-                            changed = true;
-                            return true;
-                        }
+                        instr.OpCode = OpCodes.Nop;
+                        instr.Operand = null;
+                        changed = true;
+                        return true;
                     }
+                    
+                    // Если мы знаем, что условие всегда истинно/ложно (сложная логика, пока пропускаем для простоты)
+                    // Здесь можно добавить логику: если knownValue == compareValue, то заменяем на безусловный переход
                 }
             }
             return false;
@@ -178,7 +165,10 @@ namespace Deobfuscator
         /// </summary>
         private void RemoveUnreachableBlocks(MethodDef method)
         {
-            var instructions = method.Body.Instructions;
+            var body = method.Body;
+            if (body == null) return;
+            
+            var instructions = body.Instructions;
             if (instructions.Count == 0) return;
 
             // Вычисляем достижимые инструкции
@@ -226,22 +216,21 @@ namespace Deobfuscator
             }
 
             // Заменяем недостижимые инструкции на Nop
-            bool changed = false;
+            bool hasChanges = false;
             for (int i = 0; i < instructions.Count; i++)
             {
                 if (!reachable.Contains(instructions[i]))
                 {
-                    // Не удаляем физически из списка (чтобы не ломать индексы ветвлений), а заменяем на Nop
                     instructions[i].OpCode = OpCodes.Nop;
                     instructions[i].Operand = null;
-                    changed = true;
+                    hasChanges = true;
                 }
             }
 
-            if (changed)
+            if (hasChanges)
             {
-                method.Body.SimplifyMacros();
-                method.Body.UpdateInstructionOffsets();
+                SimplifyMacrosSafe(method);
+                body.UpdateInstructionOffsets();
             }
         }
 
@@ -285,8 +274,17 @@ namespace Deobfuscator
                 }
             }
             
-            body.SimplifyMacros();
+            SimplifyMacrosSafe(method);
             body.UpdateInstructionOffsets();
+        }
+
+        // Безопасный вызов SimplifyMacros с передачей параметров метода
+        private void SimplifyMacrosSafe(MethodDef method)
+        {
+            if (method.Body != null && method.Parameters != null)
+            {
+                method.Body.SimplifyMacros(method.Parameters);
+            }
         }
 
         private bool IsStloc(Instruction instr, out int localIndex)
@@ -348,8 +346,6 @@ namespace Deobfuscator
         private bool IsObfuscatedName(string name)
         {
             if (string.IsNullOrEmpty(name)) return false;
-            // Простая эвристика: имена типа "a", "A", "?", "<>c__..." (последнее лучше не трогать без нужды)
-            // Или имена состоящие из непечататемых символов или очень странные
             if (name.Length == 1 && char.IsLetter(name[0])) return true;
             if (name.StartsWith("?") || name.StartsWith(" ")) return true;
             return false;
@@ -361,7 +357,6 @@ namespace Deobfuscator
 
             try
             {
-                // Берем первые 10 инструкций для контекста
                 var ilSnippet = string.Join("\n", method.Body.Instructions.Take(10).Select(x => x.ToString()));
                 var suggested = _aiAssistant.GetSuggestedName(method.Name, ilSnippet, method.ReturnType?.ToString() ?? "void");
                 
