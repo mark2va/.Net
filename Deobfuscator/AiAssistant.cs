@@ -1,78 +1,80 @@
 using System;
-using System.IO;
-using System.Net;
+using System.Net.Http;
 using System.Text;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
+using System.Text.Json;
+using System.Threading.Tasks;
 
 namespace Deobfuscator
 {
+    public class AiConfig
+    {
+        public bool Enabled { get; set; }
+        public string Endpoint { get; set; } = "http://localhost:11434/api/generate"; // Пример для Ollama
+        public string Model { get; set; } = "llama3"; // Или ваша модель
+
+        public AiConfig() { }
+    }
+
     public class AiAssistant : IDisposable
     {
+        private readonly HttpClient _httpClient;
         private readonly AiConfig _config;
-        private HttpWebRequest? _currentRequest;
-
-        public bool Enabled => _config.Enabled;
 
         public AiAssistant(AiConfig config)
         {
             _config = config;
+            _httpClient = new HttpClient();
+            _httpClient.Timeout = TimeSpan.FromSeconds(30);
         }
 
-        public string? GetSuggestedName(string currentName, string methodBodyIl, string returnType)
+        public string? GetSuggestedName(string currentName, string ilSnippet, string returnType)
         {
-            if (!_config.Enabled) return null;
-
             try
             {
-                string prompt = $"Analyze this C# method IL code and suggest a meaningful name in camelCase. Return ONLY the name, no explanation.\n" +
-                                $"Return type: {returnType}\n" +
-                                $"Current name: {currentName}\n" +
-                                $"IL Code snippet:\n{methodBodyIl}";
+                var prompt = $@"Analyze this obfuscated C# method and suggest a meaningful name.
+Return ONLY the name, no explanation.
+Return Type: {returnType}
+Current Name: {currentName}
+IL Code:
+{ilSnippet}
 
-                var requestBody = new
+Suggested name:";
+
+                var payload = new
                 {
                     model = _config.Model,
                     prompt = prompt,
                     stream = false,
-                    options = new { temperature = 0.1, num_predict = 50 }
+                    options = new { temperature = 0.1 }
                 };
 
-                string json = JsonConvert.SerializeObject(requestBody);
-                byte[] data = Encoding.UTF8.GetBytes(json);
+                var json = JsonSerializer.Serialize(payload);
+                var content = new StringContent(json, Encoding.UTF8, "application/json");
 
-                _currentRequest = (HttpWebRequest)WebRequest.Create($"{_config.ApiUrl}/api/generate");
-                _currentRequest.Method = "POST";
-                _currentRequest.ContentType = "application/json";
-                _currentRequest.Timeout = _config.TimeoutSeconds * 1000;
-
-                using (var stream = _currentRequest.GetRequestStream())
+                var response = _httpClient.PostAsync(_config.Endpoint, content).Result;
+                
+                if (response.IsSuccessStatusCode)
                 {
-                    stream.Write(data, 0, data.Length);
-                }
-
-                using (var response = (HttpWebResponse)_currentRequest.GetResponse())
-                using (var reader = new StreamReader(response.GetResponseStream()))
-                {
-                    string result = reader.ReadToEnd();
-                    var jsonResponse = JObject.Parse(result);
-                    return jsonResponse["response"]?.ToString().Trim();
+                    var responseString = response.Content.ReadAsStringAsync().Result;
+                    using var doc = JsonDocument.Parse(responseString);
+                    if (doc.RootElement.TryGetProperty("response", out var el))
+                    {
+                        var name = el.GetString()?.Trim();
+                        if (!string.IsNullOrEmpty(name))
+                            return name;
+                    }
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[AI Error]: {ex.Message}");
-                return null;
+                Console.WriteLine($"[AI] Request failed: {ex.Message}");
             }
-            finally
-            {
-                _currentRequest = null;
-            }
+            return null;
         }
 
         public void Dispose()
         {
-            _currentRequest?.Abort();
+            _httpClient.Dispose();
         }
     }
 }
