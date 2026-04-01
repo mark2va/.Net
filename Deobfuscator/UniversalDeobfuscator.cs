@@ -50,180 +50,157 @@ namespace Deobfuscator
         }
 
         /// <summary>
-        /// Эмулирует выполнение для построения правильного линейного потока.
+        /// Эмулирует выполнение метода, чтобы построить линейный поток инструкций,
+        /// игнорируя обфусцированные переходы по состоянию.
         /// </summary>
-        private bool EmulateAndUnravel(MethodDef method)
+        private void EmulateAndUnravel(MethodDef method)
         {
             var body = method.Body;
-            if (body.Instructions.Count == 0) return false;
-
-            // Попытка найти переменную состояния
-            var stateVarIndex = FindStateVariableIndex(method);
+            if (body == null || !body.HasInstructions) return;
+            // 1. Находим переменную состояния
+            var stateVarInfo = FindStateVariable(method);
+            if (stateVarInfo == null) return; // Не похоже на этот тип обфускации
+            int stateVarIndex = stateVarInfo.Value.Index;
             
-            // Если это не похоже на state machine, пробуем простое упрощение ветвлений
-            if (stateVarIndex == -1)
+            // 2. Эмулируем поток, собирая только нужные инструкции
+            var linearInstructions = new List<Instruction>();
+            var instructionMap = new Dictionary<int, Instruction>(); // Оригинал -> Клон
+            
+            // Создаем клоны всех инструкций заранее, чтобы перемапить ветвления
+            foreach (var instr in body.Instructions)
             {
-                return SimplifyConditionalJumps(method);
+                instructionMap[instr.Offset] = CloneInstruction(instr);
             }
-
-            // Эмуляция state machine
-            var newInstructions = new List<Instruction>();
-            var visitedStates = new HashSet<int>(); // Для предотвращения зацикливания при эмуляции
+            // Эмуляция
+            var ipStack = new Stack<int>();
+            var visitedOffsets = new HashSet<int>();
             
-            // Стек для хранения точек возврата (если бы были подпрограммы), здесь просто очередь инструкций
-            var queue = new Queue<Instruction>();
-            queue.Enqueue(body.Instructions[0]);
-
-            // Карта: Инструкция -> Следующая инструкция (после разрешения переходов)
-            // В данном случае мы просто идем по пути выполнения
-            
-            // Инициализация эмуляции
-            // Нам нужно найти первое присваивание константы переменной состояния
-            long? currentState = null;
-            
-            // Первый проход: найдем начальное значение
-            for (int i = 0; i < body.Instructions.Count - 1; i++)
+            // Точка входа
+            ipStack.Push(0);
+            while (ipStack.Count > 0)
             {
-                if (IsStloc(body.Instructions[i+1], stateVarIndex))
+                int currentOffset = ipStack.Pop();
+                if (!instructionMap.ContainsKey(currentOffset)) continue;
+                if (visitedOffsets.Contains(currentOffset)) continue;
+                
+                visitedOffsets.Add(currentOffset);
+                
+                // Получаем оригинальную инструкцию по оффсету (примерно)
+                // Так как оффсеты могут быть неточными после клонирования, ищем по индексу или совпадению
+                var originalInstr = body.Instructions.FirstOrDefault(x => x.Offset == currentOffset);
+                if (originalInstr == null) continue;
+                var clonedInstr = instructionMap[currentOffset];
+                
+                // Пропускаем инструкции, связанные с состоянием (запись в state var)
+                if (IsStloc(originalInstr, out int setIdx) && setIdx == stateVarIndex)
                 {
-                    var val = GetInt64Value(body.Instructions[i]);
-                    if (val.HasValue)
+                    // Не добавляем в результат, но продолжаем выполнение
+                    // Обновляем наше "виртуальное" состояние, если нужно для логики, 
+                    // но в данном случае мы просто игнорируем изменение флага
+                    goto NextInstruction;
+                }
+                // Пропускаем загрузку константы, если следующая инструкция - запись в state var
+                if (IsConstantLoad(originalInstr))
+                {
+                    var nextInstr = GetNextInstruction(body, originalInstr);
+                    if (nextInstr != null && IsStloc(nextInstr, out int nextIdx) && nextIdx == stateVarIndex)
                     {
-                        currentState = val.Value;
-                        break;
+                        goto NextInstruction;
                     }
                 }
-            }
-
-            if (!currentState.HasValue) return false;
-
-            // Основной цикл эмуляции
-            // Мы будем сканировать инструкции и выполнять только те блоки, куда ведет логика
-            var processedInstructions = new HashSet<Instruction>();
-            var workList = new List<Instruction> { body.Instructions[0] };
-            
-            while(workList.Count > 0)
-            {
-                var currentInstr = workList[0];
-                workList.RemoveAt(0);
-
-                if (processedInstructions.Contains(currentInstr)) continue;
-                
-                // Простой линейный проход от currentInstr до конца метода или пока не встретим управляющую конструкцию
-                int idx = body.Instructions.IndexOf(currentInstr);
-                if (idx == -1) continue;
-
-                while (idx < body.Instructions.Count)
+                // Обработка ветвлений
+                if (clonedInstr.OpCode.FlowControl == FlowControl.Cond_Branch)
                 {
-                    var instr = body.Instructions[idx];
+                    // Пытаемся определить, куда идти, эмулируя условие
+                    // В простейшем случае, если это сравнение с состоянием, мы уже решили путь выше.
+                    // Здесь мы просто берем первый путь (true) или второй, в зависимости от контекста.
+                    // Но так как мы идем линейно, нам нужно решить, какое ветвление правильное.
                     
-                    if (processedInstructions.Contains(instr)) 
+                    // Хак: если это obfuscated flow, обычно одно ветвление ведет на "мусор" (другие кейсы),
+                    // а другое на продолжение. Мы уже отфильтровали мусор через visitedOffsets? Нет.
+                    
+                    // Правильный подход для этого типа обфускации:
+                    // Мы НЕ должны добавлять само условное ветвление в чистый код, если оно зависит от state var.
+                    // Вместо этого мы должны подставить безусловный переход (Br) в нужный блок или убрать его.
+                    
+                    // Проверяем, зависит ли условие от state var
+                    bool dependsOnState = CheckDependsOnState(body, originalInstr, stateVarIndex);
+                    
+                    if (dependsOnState)
                     {
-                        // Если мы наткнулись на уже обработанную инструкцию (цикл), проверяем, нужно ли идти дальше
-                        break; 
-                    }
-
-                    // Анализ инструкций
-                    if (instr.OpCode.Code == Code.Nop)
-                    {
-                        idx++;
-                        continue;
-                    }
-
-                    // Проверка на изменение состояния: num = X
-                    if (IsStloc(instr, stateVarIndex) && idx > 0)
-                    {
-                        var prev = body.Instructions[idx - 1];
-                        var newVal = GetInt64Value(prev);
-                        if (newVal.HasValue)
+                        // Решаем, куда идти, основываясь на логике обфускатора (обычно fall-through или конкретный target)
+                        // В данном примере мы просто идём по пути, который ведет к новым инструкциям, 
+                        // которые ещё не посещены и не являются "ловушками".
+                        // Для простоты: берем target, если он ведет вперед, иначе следующий.
+                        
+                        var target = clonedInstr.Operand as Instruction;
+                        if (target != null)
                         {
-                            // Это просто обновление состояния, саму инструкцию пропускаем (она мусор в линейном коде)
-                            // Но нам нужно понять, куда идти дальше. 
-                            // Обычно после stloc идет либо проверка (ldloc + bne), либо конец блока
-                            idx++;
-                            continue; 
-                        }
-                    }
-
-                    // Проверка на условие выхода из цикла состояния: while (num != X) или if (num == X)
-                    if (instr.OpCode.FlowControl == FlowControl.Cond_Branch)
-                    {
-                        // Пытаемся разрешить переход
-                        if (idx >= 2)
-                        {
-                            var prev1 = body.Instructions[idx - 1]; // Значение для сравнения (константа)
-                            var prev2 = body.Instructions[idx - 2]; // Загрузка переменной (ldloc)
-
-                            if (IsLdloc(prev2, stateVarIndex))
+                            // Маппинг таргета
+                            var targetOffset = GetOriginalOffset(body, target);
+                            if (targetOffset.HasValue && !visitedOffsets.Contains(targetOffset.Value))
                             {
-                                var compareVal = GetInt64Value(prev1);
-                                if (compareVal.HasValue)
-                                {
-                                    bool takeJump = EvaluateBranch(currentState.Value, compareVal.Value, instr.OpCode.Code);
-                                    
-                                    Instruction nextInstr = takeJump ? (Instruction)instr.Operand : body.Instructions[idx + 1];
-                                    
-                                    if (nextInstr != null && !processedInstructions.Contains(nextInstr))
-                                    {
-                                        workList.Add(nextInstr);
-                                    }
-                                    
-                                    // Условие resolved, саму инструкцию ветвления не добавляем в новый код
-                                    idx++;
-                                    continue;
-                                }
+                                // Заменяем условный переход на безусловный, если это единственный путь
+                                clonedInstr.OpCode = OpCodes.Br;
+                                // Нужно найти клон таргета
+                                var clonedTarget = FindClonedInstruction(linearInstructions, instructionMap, target);
+                                if (clonedTarget != null) clonedInstr.Operand = clonedTarget;
+                                else ipStack.Push(targetOffset.Value);
+                            }
+                            else
+                            {
+                                // Переход в уже посещенное или назад - убираем переход (continue)
+                                clonedInstr.OpCode = OpCodes.Nop;
+                                clonedInstr.Operand = null;
                             }
                         }
                     }
-
-                    // Если это не управляющая инструкция состояния, добавляем её в результат
-                    // Но сначала проверим, не является ли она частью логики состояния (ldloc, ldc)
-                    bool isStateLogic = false;
-                    
-                    // Пропускаем ldc, если следующая stloc переменной состояния
-                    if (idx + 1 < body.Instructions.Count && IsStloc(body.Instructions[idx+1], stateVarIndex))
+                    else
                     {
-                         if (GetInt64Value(instr).HasValue) isStateLogic = true;
-                    }
-                    // Пропускаем ldloc переменной состояния, если используется для сравнения
-                    if (IsLdloc(instr, stateVarIndex) && idx + 2 < body.Instructions.Count)
-                    {
-                        var next = body.Instructions[idx+1];
-                        var next2 = body.Instructions[idx+2];
-                        if (GetInt64Value(next).HasValue && next2.OpCode.FlowControl == FlowControl.Cond_Branch)
+                        // Обычное ветвление (не обфускация состояния) - оставляем как есть и планируем оба пути
+                        var target = clonedInstr.Operand as Instruction;
+                        if (target != null)
                         {
-                            isStateLogic = true;
+                             var targetOffset = GetOriginalOffset(body, target);
+                             if (targetOffset.HasValue) ipStack.Push(targetOffset.Value);
                         }
-                    }
-
-                    if (!isStateLogic)
-                    {
-                        newInstructions.Add(CloneInstruction(instr));
-                    }
-
-                    processedInstructions.Add(instr);
-                    idx++;
-                    
-                    // Если встретили безусловный переход или возврат
-                    if (instr.OpCode.FlowControl == FlowControl.Branch || 
-                        instr.OpCode.FlowControl == FlowControl.Ret ||
-                        instr.OpCode.FlowControl == FlowControl.Throw)
-                    {
-                        if (instr.Operand is Instruction target)
+                        
+                        var nextOrig = GetNextInstruction(body, originalInstr);
+                        if (nextOrig != null)
                         {
-                            if (!processedInstructions.Contains(target)) workList.Add(target);
+                            ipStack.Push(nextOrig.Offset);
                         }
-                        break; 
                     }
                 }
+                else if (clonedInstr.OpCode.Code == Code.Br || clonedInstr.OpCode.Code == Code.Leave || clonedInstr.OpCode.Code == Code.Leave_S)
+                {
+                    var target = clonedInstr.Operand as Instruction;
+                    if (target != null)
+                    {
+                        var targetOffset = GetOriginalOffset(body, target);
+                        if (targetOffset.HasValue) ipStack.Push(targetOffset.Value);
+                    }
+                }
+                else if (clonedInstr.OpCode.Code == Code.Ret || clonedInstr.OpCode.Code == Code.Throw)
+                {
+                    // Конец пути
+                }
+                else
+                {
+                    // Обычная инструкция: планируем следующую
+                    var nextOrig = GetNextInstruction(body, originalInstr);
+                    if (nextOrig != null)
+                    {
+                        ipStack.Push(nextOrig.Offset);
+                    }
+                }
+                linearInstructions.Add(clonedInstr);
+                NextInstruction:;
             }
-
-            if (newInstructions.Count > 0)
+            if (linearInstructions.Count > 0)
             {
-                ReplaceMethodBody(method, newInstructions);
-                return true;
+                ReplaceMethodBody(method, linearInstructions);
             }
-
             return false;
         }
 
