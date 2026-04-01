@@ -22,58 +22,56 @@ namespace Deobfuscator
             string outputFile;
 
             // Логика определения выходного файла
-            if (args.Length >= 2)
+            if (args.Length >= 2 && !args[1].StartsWith("--"))
             {
-                // Если указан второй аргумент, используем его как путь выхода
                 outputFile = args[1];
             }
             else
             {
-                // Если аргумент один, создаем имя в той же папке с суффиксом _deob
-                string directory = Path.GetDirectoryName(inputFile);
-                string fileNameWithoutExt = Path.GetFileNameWithoutExtension(inputFile);
-                string extension = Path.GetExtension(inputFile);
-                
-                if (string.IsNullOrEmpty(directory))
-                {
-                    // Если файл в текущей папке
-                    outputFile = fileNameWithoutExt + "_deob" + extension;
-                }
-                else
-                {
-                    outputFile = Path.Combine(directory, fileNameWithoutExt + "_deob" + extension);
-                }
-                
-                Console.WriteLine("[*] Output file not specified. Using: " + outputFile);
+                string dir = Path.GetDirectoryName(inputFile) ?? ".";
+                string name = Path.GetFileNameWithoutExtension(inputFile);
+                string ext = Path.GetExtension(inputFile);
+                outputFile = Path.Combine(dir, name + "_deob" + ext);
+                Console.WriteLine($"[*] Output file not specified. Using: {outputFile}");
             }
 
             if (!File.Exists(inputFile))
             {
-                Console.WriteLine("[Error] File not found: " + inputFile);
+                Console.WriteLine($"[Error] File not found: {inputFile}");
                 return 1;
             }
 
-            // Парсинг аргументов вручную для совместимости
             var aiConfig = new AiConfig();
             
-            for (int i = 1; i < args.Length; i++) // Начинаем с 1, так как 0 это файл
+            // Парсинг флагов
+            for (int i = 2; i < args.Length; i++) // Начинаем с 2, т.к. 0=file, 1=output(опционально)
             {
-                switch (args[i])
+                // Если второй аргумент был флагом, то outputFile еще не задан явно, значит i=1 это флаг
+                // Корректировка логики парсинга:
+                // Если args[1] начинается с --, то output генерируется автоматически, и парсим с 1
+                int startIdx = (args.Length > 1 && !args[1].StartsWith("--")) ? 2 : 1;
+                
+                // Перезапустим цикл правильно
+                for (int j = startIdx; j < args.Length; j++)
                 {
-                    case "--ai":
-                        aiConfig.Enabled = true;
-                        break;
-                    case "--ai-url":
-                        if (i + 1 < args.Length) aiConfig.ApiUrl = args[++i];
-                        break;
-                    case "--ai-model":
-                        if (i + 1 < args.Length) aiConfig.Model = args[++i];
-                        break;
-                    case "--ai-timeout":
-                        if (i + 1 < args.Length && int.TryParse(args[++i], out int t))
-                            aiConfig.TimeoutSeconds = t;
-                        break;
+                    switch (args[j])
+                    {
+                        case "--ai":
+                            aiConfig.Enabled = true;
+                            break;
+                        case "--ai-url":
+                            if (j + 1 < args.Length) aiConfig.ApiUrl = args[++j];
+                            break;
+                        case "--ai-model":
+                            if (j + 1 < args.Length) aiConfig.Model = args[++j];
+                            break;
+                        case "--ai-timeout":
+                            if (j + 1 < args.Length && int.TryParse(args[++j], out int t))
+                                aiConfig.TimeoutSeconds = t;
+                            break;
+                    }
                 }
+                break; // Выход из внешнего цикла, так как внутренний все сделал
             }
 
             try
@@ -87,7 +85,7 @@ namespace Deobfuscator
             }
             catch (Exception ex)
             {
-                Console.WriteLine("[Fatal Error]: " + ex.Message);
+                Console.WriteLine($"[Fatal Error]: {ex.Message}");
                 Console.WriteLine(ex.StackTrace);
                 return 1;
             }
@@ -95,15 +93,17 @@ namespace Deobfuscator
 
         static void PrintUsage()
         {
-            Console.WriteLine("Usage:");
-            Console.WriteLine("  Deobfuscator.exe <input.exe>                     (Saved as input_deob.exe)");
-            Console.WriteLine("  Deobfuscator.exe <input.exe> <output.exe>        (Custom output path)");
+            Console.WriteLine("Usage: Deobfuscator.exe <input.exe> [output.exe] [options]");
+            Console.WriteLine();
+            Console.WriteLine("Arguments:");
+            Console.WriteLine("  input.exe       Path to obfuscated file");
+            Console.WriteLine("  output.exe      (Optional) Path to save result. Default: <input>_deob.exe");
             Console.WriteLine();
             Console.WriteLine("Options:");
-            Console.WriteLine("  --ai                 Enable AI renaming (requires local server)");
+            Console.WriteLine("  --ai                 Enable AI renaming");
             Console.WriteLine("  --ai-url <url>       AI Server URL (default: http://localhost:11434)");
-            Console.WriteLine("  --ai-model <name>    Model name (default: codellama)");
-            Console.WriteLine("  --ai-timeout <sec>   Request timeout in seconds (default: 120)");
+            Console.WriteLine("  --ai-model <name>    Model name (default: llama3)");
+            Console.WriteLine("  --ai-timeout <sec>   Request timeout (default: 120)");
         }
     }
 }
