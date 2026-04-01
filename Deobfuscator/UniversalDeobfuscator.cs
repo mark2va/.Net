@@ -123,36 +123,23 @@ namespace Deobfuscator
                         continue;
                     }
                 }
-                else if (flowAction.FlowControl == FlowControl.Cond_Branch)
+               if (instr.OpCode.FlowControl == FlowControl.Cond_Branch)
                 {
-                    // Если мы смогли вычислить условие во время симуляции
-                    if (flowAction.ConditionResult.HasValue)
+                    // Пытаемся вычислить условие
+                    bool? conditionResult = EvaluateConditionAt(method, ip, locals, stack, stateVarIndex);
+                    
+                    // Объявляем target заранее, чтобы избежать CS0165
+                    Instruction? target = null;
+                    if (instr.Operand is Instruction)
                     {
-                        // Патчим инструкцию прямо сейчас!
-                        if (instr.Operand is Instruction target)
+                        target = (Instruction)instr.Operand;
+                    }
+
+                    if (conditionResult.HasValue && target != null)
+                    {
+                        if (conditionResult.Value)
                         {
-                            if (flowAction.ConditionResult.Value)
-                            {
-                                // Условие истинно: превращаем в безусловный переход
-                                instr.OpCode = OpCodes.Br;
-                                instr.Operand = target;
-                            }
-                            else
-                            {
-                                // Условие ложно: превращаем в NOP (переход на следующую)
-                                instr.OpCode = OpCodes.Nop;
-                                instr.Operand = null;
-                            }
-                        }
-                        // Двигаемся по пути, который выбрали бы в реальности
-                        if (flowAction.ConditionResult.Value && instr.Operand != null) 
-                        {
-                             // Если мы заменили на Br, Operand сохранился, но нам нужно перейти туда
-                             // Но так как мы уже изменили OpCode на Br, логика ниже сама обработает?
-                             // Нет, мы в цикле эмуляции. Нам нужно вручную перейти по нужному пути для продолжения эмуляции.
-                             // Поскольку мы уже изменили инструкцию, можно просто использовать новую логику?
-                             // Проще: используем вычисленное значение для перехода эмулятора.
-                             ip = instructions.IndexOf(target);
+                            ip = instructions.IndexOf(target);
                         }
                         else
                         {
@@ -160,6 +147,13 @@ namespace Deobfuscator
                         }
                         continue;
                     }
+                    else
+                    {
+                        // Не смогли вычислить или нет цели перехода
+                        ip++; 
+                    }
+                    continue;
+                }
                     else
                     {
                         // Не смогли вычислить (реальное условие). Просто идем дальше (упрощенно: считаем false или true?)
