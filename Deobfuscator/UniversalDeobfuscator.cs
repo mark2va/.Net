@@ -638,7 +638,7 @@ namespace Deobfuscator
             for (int i = instructions.Count - 1; i >= 0; i--)
             {
                 var instr = instructions[i];
-                if (instr.OpCode.FlowControl == FlowControl.Ret || instr.OpCode.FlowControl == FlowControl.Throw)
+                if (instr.OpCode.FlowControl == FlowControl.Return || instr.OpCode.FlowControl == FlowControl.Throw)
                 {
                     for (int j = i + 1; j < instructions.Count; j++)
                     {
