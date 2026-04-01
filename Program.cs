@@ -1,6 +1,5 @@
 using System;
 using System.IO;
-using System.Reflection;
 
 namespace Deobfuscator
 {
@@ -21,13 +20,13 @@ namespace Deobfuscator
             string inputFile = args[0];
             string outputFile;
 
-            // Логика определения выходного файла
-            if (args.Length >= 2 && !args[1].StartsWith("--"))
+            if (args.Length >= 2)
             {
                 outputFile = args[1];
             }
             else
             {
+                // Генерация имени выходного файла
                 string dir = Path.GetDirectoryName(inputFile) ?? "";
                 string name = Path.GetFileNameWithoutExtension(inputFile);
                 string ext = Path.GetExtension(inputFile);
@@ -43,27 +42,8 @@ namespace Deobfuscator
 
             var aiConfig = new AiConfig();
             
-            // Парсинг флагов
-            for (int i = 2; i < args.Length; i++) // Начинаем с 2, т.к. 0=file, 1=output(опционально)
-            {
-                // Если второй аргумент был флагом, то outputFile уже установлен по умолчанию, и парсим с 1
-                // Но выше мы проверили startsWith("--"). 
-                // Для надежности перепишем цикл:
-            }
-            
-            // Перезапуск парсинга для надежности
-            int startIdx = 1;
-            if (args.Length > 1 && !args[1].StartsWith("--"))
-            {
-                startIdx = 2;
-            }
-            else
-            {
-                // Если второго файла нет, значит все начиная с 1 - флаги
-                startIdx = 1;
-            }
-
-            for (int i = startIdx; i < args.Length; i++)
+            // Парсинг аргументов начиная с 1 (так как 0 - это входной файл)
+            for (int i = 1; i < args.Length; i++)
             {
                 switch (args[i])
                 {
