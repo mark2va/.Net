@@ -236,6 +236,13 @@ namespace Deobfuscator
 
             var instructions = body.Instructions;
             
+            // Сначала пробуем новый подход с эмуляцией запутанных циклов
+            if (TryEmulateObfuscatedLoops(method))
+            {
+                Log("Successfully emulated obfuscated loops");
+                return true;
+            }
+            
             // 1. Поиск переменной состояния
             int stateVarIndex = -1;
             object? initialState = null;
@@ -350,6 +357,287 @@ namespace Deobfuscator
             Log($"Final instruction count: {finalInstructions.Count}");
             ReplaceMethodBody(method, finalInstructions);
             return true;
+        }
+
+        /// <summary>
+        /// Эмулирует выполнение запутанных циклов с переменной состояния
+        /// Обрабатывает паттерны типа do-while с множественными условиями и переназначениями
+        /// </summary>
+        private bool TryEmulateObfuscatedLoops(MethodDef method)
+        {
+            var body = method.Body;
+            var instructions = body.Instructions;
+            if (instructions.Count < 10) return false;
+
+            // Ищем паттерн: инициализация переменной + do-while цикл
+            int stateVarIndex = -1;
+            object? initialState = null;
+            int initInstrIndex = -1;
+
+            // Шаг 1: Поиск инициализации переменной в начале метода
+            for (int i = 0; i < Math.Min(10, instructions.Count - 1); i++)
+            {
+                if (IsStloc(instructions[i + 1], out int idx))
+                {
+                    var val = GetConstantValue(instructions[i]);
+                    if (val != null)
+                    {
+                        stateVarIndex = idx;
+                        initialState = val;
+                        initInstrIndex = i;
+                        Log($"Found loop state variable: V_{stateVarIndex}, Initial: {initialState}");
+                        break;
+                    }
+                }
+            }
+
+            if (stateVarIndex == -1) return false;
+
+            // Шаг 2: Поиск структуры do-while
+            // Ищем последовательность: проверка условия -> ветвление -> обратный прыжок
+            var loopStartIndex = FindDoWhileLoopStart(instructions, stateVarIndex);
+            if (loopStartIndex == -1)
+            {
+                Log("No do-while loop pattern found");
+                return false;
+            }
+
+            Log($"Found do-while loop starting at index {loopStartIndex}");
+
+            // Шаг 3: Извлечение всех блоков кода из условий
+            var stateTransitions = new Dictionary<object, Tuple<object?, List<Instruction>>>();
+            var conditionTargets = new Dictionary<object, Instruction>();
+
+            for (int i = loopStartIndex; i < instructions.Count; i++)
+            {
+                var instr = instructions[i];
+                
+                // Пропускаем инструкции до конца метода или ret
+                if (instr.OpCode.Code == Code.Ret || instr.OpCode.Code == Code.Throw)
+                    break;
+
+                // Ищем паттерн: ldloc + ldc + ceq/clt/cgt + brtrue/brfalse
+                if (i + 3 < instructions.Count &&
+                    GetLocalIndex(instr) == stateVarIndex &&
+                    GetConstantValue(instructions[i + 1]) is object checkVal)
+                {
+                    var cmpInstr = instructions[i + 2];
+                    var branchInstr = instructions[i + 3];
+
+                    if ((cmpInstr.OpCode.Code == Code.Ceq || cmpInstr.OpCode.Code == Code.Cgt || 
+                         cmpInstr.OpCode.Code == Code.Clt || cmpInstr.OpCode.Code == Code.Cgt_Un ||
+                         cmpInstr.OpCode.Code == Code.Clt_Un) &&
+                        (branchInstr.OpCode.Code == Code.Brtrue || branchInstr.OpCode.Code == Code.Brtrue_S ||
+                         branchInstr.OpCode.Code == Code.Brfalse || branchInstr.OpCode.Code == Code.Brfalse_S))
+                    {
+                        var target = branchInstr.Operand as Instruction;
+                        if (target != null && !conditionTargets.ContainsKey(checkVal))
+                        {
+                            conditionTargets[checkVal] = target;
+                            Log($"Found condition: state == {checkVal} -> target offset {target.Offset}");
+                        }
+                    }
+                }
+            }
+
+            // Шаг 4: Для каждого условия извлекаем блок кода до следующего присваивания состояния
+            foreach (var kvp in conditionTargets)
+            {
+                var checkVal = kvp.Key;
+                var target = kvp.Value;
+
+                var block = ExtractLoopBlock(instructions, target, stateVarIndex, out object? nextState);
+                
+                if (!stateTransitions.ContainsKey(checkVal))
+                {
+                    stateTransitions[checkVal] = Tuple.Create(nextState, block);
+                    Log($"State {checkVal}: {block.Count} instructions, next state: {nextState}");
+                }
+            }
+
+            if (stateTransitions.Count == 0)
+            {
+                Log("No state transitions found in loop");
+                return false;
+            }
+
+            // Шаг 5: Эмуляция выполнения цикла
+            var finalInstructions = new List<Instruction>();
+            var currentState = initialState;
+            var visitedStates = new HashSet<object>();
+            int maxIterations = stateTransitions.Count * 3 + 10; // Защита от бесконечного цикла
+            int iteration = 0;
+
+            Log($"Starting loop emulation from state {currentState}");
+
+            while (iteration < maxIterations)
+            {
+                iteration++;
+                
+                // Проверяем, не зациклились ли мы
+                if (visitedStates.Contains(currentState))
+                {
+                    Log($"Detected cycle at state {currentState}, stopping emulation");
+                    break;
+                }
+
+                if (currentState == null)
+                {
+                    Log("State became null, stopping emulation");
+                    break;
+                }
+
+                visitedStates.Add(currentState);
+
+                if (stateTransitions.TryGetValue(currentState, out var transition))
+                {
+                    var nextState = transition.Item1;
+                    var block = transition.Item2;
+
+                    Log($"Iteration {iteration}: Processing state {currentState}, adding {block.Count} instructions");
+
+                    // Добавляем инструкции блока (кроме загрузки/сохранения состояния)
+                    foreach (var ins in block)
+                    {
+                        // Пропускаем только явные загрузки переменной состояния
+                        if (GetLocalIndex(ins) == stateVarIndex &&
+                            (ins.OpCode.Code == Code.Ldloc || ins.OpCode.Code == Code.Ldloc_S ||
+                             (ins.OpCode.Code >= Code.Ldloc_0 && ins.OpCode.Code <= Code.Ldloc_3)))
+                        {
+                            continue;
+                        }
+
+                        // Пропускаем store состояния (они будут в конце блока)
+                        if (IsStloc(ins, out int sIdx) && sIdx == stateVarIndex)
+                        {
+                            continue;
+                        }
+
+                        finalInstructions.Add(CloneInstruction(ins));
+                    }
+
+                    // Переходим к следующему состоянию
+                    if (nextState != null && nextState.Equals(currentState))
+                    {
+                        Log($"State {currentState} transitions to itself, stopping");
+                        break;
+                    }
+
+                    currentState = nextState;
+                }
+                else
+                {
+                    Log($"No transition found for state {currentState}, stopping");
+                    break;
+                }
+            }
+
+            if (finalInstructions.Count == 0)
+            {
+                Log("Emulation produced no instructions");
+                return false;
+            }
+
+            Log($"Emulation complete: {finalInstructions.Count} instructions extracted after {iteration} iterations");
+            ReplaceMethodBody(method, finalInstructions);
+            return true;
+        }
+
+        /// <summary>
+        /// Находит начало do-while цикла по паттерну инструкций
+        /// </summary>
+        private int FindDoWhileLoopStart(IList<Instruction> instructions, int stateVarIndex)
+        {
+            // Ищем точку после инициализации где начинается цикл
+            // Обычно это первая загрузка переменной состояния для сравнения
+            for (int i = 0; i < instructions.Count - 3; i++)
+            {
+                if (GetLocalIndex(instructions[i]) == stateVarIndex &&
+                    GetConstantValue(instructions[i + 1]) != null &&
+                    (instructions[i + 2].OpCode.Code == Code.Ceq || 
+                     instructions[i + 2].OpCode.Code == Code.Cgt ||
+                     instructions[i + 2].OpCode.Code == Code.Clt))
+                {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        /// <summary>
+        /// Извлекает блок кода из условия цикла до следующего изменения состояния
+        /// </summary>
+        private List<Instruction> ExtractLoopBlock(IList<Instruction> allInstructions, Instruction startInstr, 
+                                                    int stateVarIndex, out object? nextState)
+        {
+            var block = new List<Instruction>();
+            nextState = null;
+
+            int startIndex = allInstructions.IndexOf(startInstr);
+            if (startIndex == -1) return block;
+
+            int ip = startIndex;
+            int maxBlockLen = 100;
+
+            while (ip < allInstructions.Count)
+            {
+                var instr = allInstructions[ip];
+
+                // Проверка на выход из метода
+                if (instr.OpCode.Code == Code.Ret || instr.OpCode.Code == Code.Throw)
+                {
+                    block.Add(CloneInstruction(instr));
+                    break;
+                }
+
+                // Проверка на изменение состояния (store)
+                if (IsStloc(instr, out int sIdx) && sIdx == stateVarIndex)
+                {
+                    // Это инструкция stloc - смотрим предыдущую для получения значения
+                    if (ip > 0)
+                    {
+                        var prevInstr = allInstructions[ip - 1];
+                        var val = GetConstantValue(prevInstr);
+                        if (val != null)
+                        {
+                            nextState = val;
+                            Log($"  Found state transition to {val}");
+                        }
+                    }
+                    // Не добавляем store состояния в блок
+                    ip++;
+                    continue;
+                }
+
+                // Пропускаем загрузки состояния
+                if (GetLocalIndex(instr) == stateVarIndex &&
+                    (instr.OpCode.Code == Code.Ldloc || instr.OpCode.Code == Code.Ldloc_S ||
+                     (instr.OpCode.Code >= Code.Ldloc_0 && instr.OpCode.Code <= Code.Ldloc_3)))
+                {
+                    ip++;
+                    continue;
+                }
+
+                // Пропускаем константы, которые идут перед store состояния
+                if (ip + 1 < allInstructions.Count &&
+                    IsStloc(allInstructions[ip + 1], out int nextSIdx) && nextSIdx == stateVarIndex)
+                {
+                    ip++;
+                    continue;
+                }
+
+                // Добавляем инструкцию в блок
+                block.Add(CloneInstruction(instr));
+
+                ip++;
+                if (block.Count > maxBlockLen)
+                {
+                    Log($"  Block exceeded max length ({maxBlockLen})");
+                    break;
+                }
+            }
+
+            return block;
         }
 
         private List<Instruction> ExtractBlockImproved(IList<Instruction> allInstructions, Instruction startInstr, int stateVarIndex, out object? nextState)
