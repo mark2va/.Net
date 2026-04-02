@@ -393,8 +393,9 @@ namespace Deobfuscator
 
             if (stateVarIndex == -1 || initialState == null) return false;
 
-            // Шаг 2: Собираем все переходы состояний из всего метода
-            // Формат: current_state -> (next_state, блок_инструкций)
+            // Шаг 2: Собираем ВСЕ переходы состояний из всего метода
+            // Ключ: значение для сравнения (checkVal)
+            // Значение: (nextState, список инструкций блока)
             var stateTransitions = new Dictionary<object, Tuple<object?, List<Instruction>>>();
             
             // Проходим по всем инструкциям и ищем паттерны условий
@@ -427,11 +428,11 @@ namespace Deobfuscator
                                 if (_debugMode && block.Count > 0)
                                 {
                                     _indentLevel++;
-                                    foreach (var ins in block.Take(5))
+                                    foreach (var ins in block.Take(8))
                                     {
                                         Log($"  {ins}");
                                     }
-                                    if (block.Count > 5) Log($"  ... and {block.Count - 5} more");
+                                    if (block.Count > 8) Log($"  ... and {block.Count - 8} more");
                                     _indentLevel--;
                                 }
                             }
@@ -447,18 +448,20 @@ namespace Deobfuscator
             }
 
             // Шаг 3: Эмуляция выполнения - проходим по цепочке состояний от начального до конечного
+            // Выполняем несколько проходов для обработки всей запутанной логики
             var finalInstructions = new List<Instruction>();
             var currentState = initialState;
             var visitedStates = new HashSet<object>();
-            int maxIterations = stateTransitions.Count * 3 + 10;
+            int maxIterations = stateTransitions.Count * 5 + 20; // Увеличиваем лимит итераций
             int iteration = 0;
 
-            Log($"Starting loop emulation from state {currentState}");
+            Log($"Starting loop emulation from state {currentState}, total transitions: {stateTransitions.Count}");
 
             while (iteration < maxIterations)
             {
                 iteration++;
                 
+                // Защита от зацикливания
                 if (visitedStates.Contains(currentState))
                 {
                     Log($"Detected cycle at state {currentState}, stopping emulation");
@@ -508,6 +511,10 @@ namespace Deobfuscator
                 return false;
             }
 
+            // Шаг 4: Очищаем результат от мусорных инструкций
+            // Удаляем оставшиеся конструкции цикла (ldc, ceq, brfalse, br которые ведут на себя)
+            finalInstructions = CleanupLoopArtifacts(finalInstructions, stateVarIndex);
+
             // Добавляем ret если его нет в конце
             var lastInstr = finalInstructions.LastOrDefault();
             if (lastInstr == null || (lastInstr.OpCode.Code != Code.Ret && lastInstr.OpCode.Code != Code.Throw))
@@ -518,6 +525,72 @@ namespace Deobfuscator
             Log($"Emulation complete: {finalInstructions.Count} instructions extracted after {iteration} iterations");
             ReplaceMethodBody(method, finalInstructions);
             return true;
+        }
+
+        /// <summary>
+        /// Удаляет артефакты цикла после эмуляции (мусорные сравнения и ветвления)
+        /// </summary>
+        private List<Instruction> CleanupLoopArtifacts(List<Instruction> instructions, int stateVarIndex)
+        {
+            var result = new List<Instruction>();
+            int i = 0;
+            
+            while (i < instructions.Count)
+            {
+                var instr = instructions[i];
+                
+                // Пропускаем загрузки переменной состояния (они больше не нужны)
+                if (GetLocalIndex(instr) == stateVarIndex)
+                {
+                    i++;
+                    continue;
+                }
+                
+                // Пропускаем константы, которые используются только для сравнения состояний
+                if ((instr.OpCode.Code == Code.Ldc_I4 || instr.OpCode.Code == Code.Ldc_R8 || 
+                     instr.OpCode.Code == Code.Ldc_I8) && i + 2 < instructions.Count)
+                {
+                    var next = instructions[i + 1];
+                    var next2 = instructions[i + 2];
+                    
+                    // Паттерн: ldc + ceq + brfalse/brtrue -> пропускаем все три
+                    if ((next.OpCode.Code == Code.Ceq || next.OpCode.Code == Code.Cgt || 
+                         next.OpCode.Code == Code.Clt) &&
+                        (next2.OpCode.Code == Code.Brfalse || next2.OpCode.Code == Code.Brfalse_S ||
+                         next2.OpCode.Code == Code.Brtrue || next2.OpCode.Code == Code.Brtrue_S))
+                    {
+                        // Пропускаем ldc, ceq, br
+                        i += 3;
+                        
+                        // Если br ведет вперед - пропускаем еще одну инструкцию (целевую)
+                        if (next2.Operand is Instruction target)
+                        {
+                            // Не удаляем целевую инструкцию, она может быть полезной
+                        }
+                        continue;
+                    }
+                }
+                
+                // Пропускаем одиночные brfalse/brtrue без полезной нагрузки
+                if ((instr.OpCode.Code == Code.Brfalse || instr.OpCode.Code == Code.Brfalse_S ||
+                     instr.OpCode.Code == Code.Brtrue || instr.OpCode.Code == Code.Brtrue_S) &&
+                    instr.Operand is Instruction brTarget)
+                {
+                    // Если ветвление ведет на себя или вперед менее чем на 2 инструкции - это мусор
+                    int targetIdx = instructions.IndexOf(brTarget);
+                    if (targetIdx <= i + 2 && targetIdx >= i)
+                    {
+                        i++;
+                        continue;
+                    }
+                }
+                
+                // Сохраняем инструкцию
+                result.Add(CloneInstruction(instr));
+                i++;
+            }
+            
+            return result;
         }
 
         /// <summary>
@@ -543,6 +616,7 @@ namespace Deobfuscator
 
         /// <summary>
         /// Извлекает блок кода из условия цикла до следующего изменения состояния
+        /// Сохраняет ВСЕ инструкции кроме загрузки переменной состояния в начале
         /// </summary>
         private List<Instruction> ExtractLoopBlock(IList<Instruction> allInstructions, Instruction startInstr, 
                                                     int stateVarIndex, out object? nextState)
@@ -554,9 +628,11 @@ namespace Deobfuscator
             if (startIndex == -1) return block;
 
             int ip = startIndex;
-            int maxBlockLen = 100;
+            int maxBlockLen = 150;
+            bool foundStateStore = false;
+            bool skipFirstLdloc = true; // Пропускаем только первую загрузку состояния
 
-            while (ip < allInstructions.Count)
+            while (ip < allInstructions.Count && !foundStateStore)
             {
                 var instr = allInstructions[ip];
 
@@ -581,29 +657,27 @@ namespace Deobfuscator
                             Log($"  Found state transition to {val}");
                         }
                     }
-                    // Не добавляем store состояния в блок
+                    // Не добавляем store состояния в блок, но прекращаем обработку
+                    foundStateStore = true;
                     ip++;
                     continue;
                 }
 
-                // Пропускаем загрузки состояния
-                if (GetLocalIndex(instr) == stateVarIndex &&
-                    (instr.OpCode.Code == Code.Ldloc || instr.OpCode.Code == Code.Ldloc_S ||
-                     (instr.OpCode.Code >= Code.Ldloc_0 && instr.OpCode.Code <= Code.Ldloc_3)))
+                // Пропускаем ТОЛЬКО первую загрузку переменной состояния (которая используется для проверки)
+                // Все остальные ldloc сохраняем - они могут быть частью полезной логики
+                if (skipFirstLdloc && GetLocalIndex(instr) == stateVarIndex && ip == startIndex)
                 {
+                    skipFirstLdloc = false;
                     ip++;
                     continue;
                 }
 
-                // Пропускаем константы, которые идут перед store состояния
-                if (ip + 1 < allInstructions.Count &&
-                    IsStloc(allInstructions[ip + 1], out int nextSIdx) && nextSIdx == stateVarIndex)
-                {
-                    ip++;
-                    continue;
-                }
-
-                // Добавляем инструкцию в блок
+                // Добавляем ВСЕ остальные инструкции включая:
+                // - ldc.* (константы)
+                // - ceq, clt, cgt (сравнения)  
+                // - brtrue, brfalse, br (ветвления)
+                // - вызовы методов
+                // - другие ldloc (которые могут загружать другие переменные)
                 block.Add(CloneInstruction(instr));
 
                 ip++;
