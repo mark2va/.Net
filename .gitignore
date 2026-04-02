@@ -1,54 +1,26 @@
 ```
 # Compiled and build artifacts
+*.obj
 *.exe
 *.dll
-*.obj
-*.pdb
-*.ilk
-*.lib
 *.so
-*.dylib
-*.class
-*.pyc
-__pycache__/
-*.o
 *.a
 *.out
 
 # Dependencies
-node_modules/
-venv/
-.venv/
-.env
-.env.local
-.env.*
+packages/
 
 # Logs and temp files
 *.log
 *.tmp
 *.swp
-*.swo
 
 # Editors
-.vscode/
+.vs/
 .idea/
 
-# Build directories
-build/
-dist/
-target/
-.gradle/
-
-# Coverage
-coverage/
-htmlcov/
-.coverage
-
-# OS generated files
-.DS_Store
-Thumbs.db
-
-# Cache directories
-.mypy_cache/
-.pytest_cache/
+# Environment
+.env
+.env.local
+*.env.*
 ```

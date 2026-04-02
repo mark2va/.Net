@@ -391,34 +391,17 @@ namespace Deobfuscator
                 }
             }
 
-            if (stateVarIndex == -1) return false;
+            if (stateVarIndex == -1 || initialState == null) return false;
 
-            // Шаг 2: Поиск структуры do-while
-            // Ищем последовательность: проверка условия -> ветвление -> обратный прыжок
-            var loopStartIndex = FindDoWhileLoopStart(instructions, stateVarIndex);
-            if (loopStartIndex == -1)
-            {
-                Log("No do-while loop pattern found");
-                return false;
-            }
-
-            Log($"Found do-while loop starting at index {loopStartIndex}");
-
-            // Шаг 3: Извлечение всех блоков кода из условий
+            // Шаг 2: Собираем все переходы состояний из всего метода
+            // Формат: current_state -> (next_state, блок_инструкций)
             var stateTransitions = new Dictionary<object, Tuple<object?, List<Instruction>>>();
-            var conditionTargets = new Dictionary<object, Instruction>();
-
-            for (int i = loopStartIndex; i < instructions.Count; i++)
+            
+            // Проходим по всем инструкциям и ищем паттерны условий
+            for (int i = 0; i < instructions.Count - 5; i++)
             {
-                var instr = instructions[i];
-                
-                // Пропускаем инструкции до конца метода или ret
-                if (instr.OpCode.Code == Code.Ret || instr.OpCode.Code == Code.Throw)
-                    break;
-
-                // Ищем паттерн: ldloc + ldc + ceq/clt/cgt + brtrue/brfalse
-                if (i + 3 < instructions.Count &&
-                    GetLocalIndex(instr) == stateVarIndex &&
+                // Паттерн: ldloc + ldc + ceq/clt/cgt + brtrue/brfalse + целевая_инструкция
+                if (GetLocalIndex(instructions[i]) == stateVarIndex &&
                     GetConstantValue(instructions[i + 1]) is object checkVal)
                 {
                     var cmpInstr = instructions[i + 2];
@@ -431,41 +414,43 @@ namespace Deobfuscator
                          branchInstr.OpCode.Code == Code.Brfalse || branchInstr.OpCode.Code == Code.Brfalse_S))
                     {
                         var target = branchInstr.Operand as Instruction;
-                        if (target != null && !conditionTargets.ContainsKey(checkVal))
+                        if (target != null)
                         {
-                            conditionTargets[checkVal] = target;
-                            Log($"Found condition: state == {checkVal} -> target offset {target.Offset}");
+                            // Извлекаем блок кода начиная с target до следующего stloc состояния
+                            var block = ExtractLoopBlock(instructions, target, stateVarIndex, out object? nextState);
+                            
+                            if (!stateTransitions.ContainsKey(checkVal) && block.Count > 0)
+                            {
+                                stateTransitions[checkVal] = Tuple.Create(nextState, block);
+                                Log($"Found transition: state == {checkVal} -> next: {nextState}, block size: {block.Count}");
+                                
+                                if (_debugMode && block.Count > 0)
+                                {
+                                    _indentLevel++;
+                                    foreach (var ins in block.Take(5))
+                                    {
+                                        Log($"  {ins}");
+                                    }
+                                    if (block.Count > 5) Log($"  ... and {block.Count - 5} more");
+                                    _indentLevel--;
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            // Шаг 4: Для каждого условия извлекаем блок кода до следующего присваивания состояния
-            foreach (var kvp in conditionTargets)
-            {
-                var checkVal = kvp.Key;
-                var target = kvp.Value;
-
-                var block = ExtractLoopBlock(instructions, target, stateVarIndex, out object? nextState);
-                
-                if (!stateTransitions.ContainsKey(checkVal))
-                {
-                    stateTransitions[checkVal] = Tuple.Create(nextState, block);
-                    Log($"State {checkVal}: {block.Count} instructions, next state: {nextState}");
-                }
-            }
-
             if (stateTransitions.Count == 0)
             {
-                Log("No state transitions found in loop");
+                Log("No state transitions found");
                 return false;
             }
 
-            // Шаг 5: Эмуляция выполнения цикла
+            // Шаг 3: Эмуляция выполнения - проходим по цепочке состояний от начального до конечного
             var finalInstructions = new List<Instruction>();
             var currentState = initialState;
             var visitedStates = new HashSet<object>();
-            int maxIterations = stateTransitions.Count * 3 + 10; // Защита от бесконечного цикла
+            int maxIterations = stateTransitions.Count * 3 + 10;
             int iteration = 0;
 
             Log($"Starting loop emulation from state {currentState}");
@@ -474,7 +459,6 @@ namespace Deobfuscator
             {
                 iteration++;
                 
-                // Проверяем, не зациклились ли мы
                 if (visitedStates.Contains(currentState))
                 {
                     Log($"Detected cycle at state {currentState}, stopping emulation");
@@ -496,30 +480,16 @@ namespace Deobfuscator
 
                     Log($"Iteration {iteration}: Processing state {currentState}, adding {block.Count} instructions");
 
-                    // Добавляем инструкции блока (кроме загрузки/сохранения состояния)
+                    // Добавляем инструкции блока
                     foreach (var ins in block)
                     {
-                        // Пропускаем только явные загрузки переменной состояния
-                        if (GetLocalIndex(ins) == stateVarIndex &&
-                            (ins.OpCode.Code == Code.Ldloc || ins.OpCode.Code == Code.Ldloc_S ||
-                             (ins.OpCode.Code >= Code.Ldloc_0 && ins.OpCode.Code <= Code.Ldloc_3)))
-                        {
-                            continue;
-                        }
-
-                        // Пропускаем store состояния (они будут в конце блока)
-                        if (IsStloc(ins, out int sIdx) && sIdx == stateVarIndex)
-                        {
-                            continue;
-                        }
-
                         finalInstructions.Add(CloneInstruction(ins));
                     }
 
                     // Переходим к следующему состоянию
-                    if (nextState != null && nextState.Equals(currentState))
+                    if (nextState == null)
                     {
-                        Log($"State {currentState} transitions to itself, stopping");
+                        Log("Next state is null, stopping");
                         break;
                     }
 
@@ -536,6 +506,13 @@ namespace Deobfuscator
             {
                 Log("Emulation produced no instructions");
                 return false;
+            }
+
+            // Добавляем ret если его нет в конце
+            var lastInstr = finalInstructions.LastOrDefault();
+            if (lastInstr == null || (lastInstr.OpCode.Code != Code.Ret && lastInstr.OpCode.Code != Code.Throw))
+            {
+                finalInstructions.Add(Instruction.Create(OpCodes.Ret));
             }
 
             Log($"Emulation complete: {finalInstructions.Count} instructions extracted after {iteration} iterations");
