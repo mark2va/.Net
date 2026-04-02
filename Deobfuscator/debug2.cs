@@ -555,8 +555,9 @@ namespace Deobfuscator
 
             int ip = startIndex;
             int maxBlockLen = 100;
+            bool foundStateStore = false;
 
-            while (ip < allInstructions.Count)
+            while (ip < allInstructions.Count && !foundStateStore)
             {
                 var instr = allInstructions[ip];
 
@@ -581,30 +582,19 @@ namespace Deobfuscator
                             Log($"  Found state transition to {val}");
                         }
                     }
-                    // Не добавляем store состояния в блок
+                    // Не добавляем store состояния в блок, но прекращаем обработку
+                    foundStateStore = true;
                     ip++;
                     continue;
                 }
 
-                // Пропускаем загрузки состояния
-                if (GetLocalIndex(instr) == stateVarIndex &&
-                    (instr.OpCode.Code == Code.Ldloc || instr.OpCode.Code == Code.Ldloc_S ||
-                     (instr.OpCode.Code >= Code.Ldloc_0 && instr.OpCode.Code <= Code.Ldloc_3)))
+                // Добавляем все инструкции в блок, включая ldloc, ldc, ceq, br и т.д.
+                // Но пропускаем только те ldloc, которые являются частью проверки состояния
+                // (они уже были обработаны при поиске перехода)
+                if (!(GetLocalIndex(instr) == stateVarIndex && ip == startIndex))
                 {
-                    ip++;
-                    continue;
+                    block.Add(CloneInstruction(instr));
                 }
-
-                // Пропускаем константы, которые идут перед store состояния
-                if (ip + 1 < allInstructions.Count &&
-                    IsStloc(allInstructions[ip + 1], out int nextSIdx) && nextSIdx == stateVarIndex)
-                {
-                    ip++;
-                    continue;
-                }
-
-                // Добавляем инструкцию в блок
-                block.Add(CloneInstruction(instr));
 
                 ip++;
                 if (block.Count > maxBlockLen)
