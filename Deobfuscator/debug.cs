@@ -113,7 +113,7 @@ namespace Deobfuscator
                             Log("Not a state machine, skipping unpacking");
                         }
                         
-                        // Проверяем, не стал ли метод пустым
+                        // Проверяем, не стал ли метод пустым или не потерял ли он return
                         if (method.Body.Instructions.Count == 0)
                         {
                             emptyMethods++;
@@ -123,8 +123,28 @@ namespace Deobfuscator
                         }
                         else if (wasModified)
                         {
-                            count++;
-                            Log($"Method successfully processed. Final instructions: {method.Body.Instructions.Count}");
+                            // Проверка: если метод должен что-то возвращать, но в конце нет ldloc перед ret
+                            if (method.ReturnType.Type != ElementType.Void)
+                            {
+                                var lastInstr = method.Body.Instructions[method.Body.Instructions.Count - 2]; // Предпоследняя (перед ret)
+                                if (lastInstr.OpCode.Code != Code.Ldloc && lastInstr.OpCode.Code != Code.Ldloc_S && 
+                                    !(lastInstr.OpCode.Code >= Code.Ldloc_0 && lastInstr.OpCode.Code <= Code.Ldloc_3))
+                                {
+                                    Log($"WARNING: Method lost its return value! Restoring original...");
+                                    RestoreMethod(method, backupInstructions);
+                                    wasModified = false;
+                                }
+                                else
+                                {
+                                    count++;
+                                    Log($"Method successfully processed. Final instructions: {method.Body.Instructions.Count}");
+                                }
+                            }
+                            else
+                            {
+                                count++;
+                                Log($"Method successfully processed. Final instructions: {method.Body.Instructions.Count}");
+                            }
                             
                             if (_debugMode && method.Body.Instructions.Count > 0)
                             {
@@ -361,8 +381,8 @@ namespace Deobfuscator
 
         /// <summary>
         /// Эмулирует выполнение запутанных циклов с переменной состояния.
-        /// Обрабатывает паттерны типа do-while с множественными условиями и переназначениями.
-        /// Полностью симулирует цикл, извлекая только полезный код.
+        /// КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Сначала определяем, какая переменная возвращается (returnVarIndex),
+        /// и затем ищем логику, которая записывает значение именно в неё.
         /// </summary>
         private bool TryEmulateObfuscatedLoops(MethodDef method)
         {
@@ -370,7 +390,30 @@ namespace Deobfuscator
             var instructions = body.Instructions;
             if (instructions.Count < 10) return false;
 
-            // 1. Поиск инициализации переменной состояния в начале метода
+            // 1. АНАЛИЗ ВОЗВРАЩАЕМОГО ЗНАЧЕНИЯ
+            // Ищем индекс локальной переменной, которая загружается перед ret
+            int returnVarIndex = -1;
+            bool hasReturn = false;
+
+            for (int i = 0; i < instructions.Count - 1; i++)
+            {
+                if (instructions[i].OpCode.Code == Code.Ret)
+                {
+                    var prev = instructions[i - 1];
+                    if (IsLdloc(prev, out int idx))
+                    {
+                        returnVarIndex = idx;
+                        hasReturn = true;
+                        Log($"Method returns variable V_{returnVarIndex}");
+                        break;
+                    }
+                }
+            }
+
+            // Если метод ничего не возвращает (void), returnVarIndex останется -1, это нормально.
+            // Но если метод должен возвращать значение, а мы не нашли ldloc перед ret - проблема в оригинале или парсинге.
+
+            // 2. Поиск инициализации переменной состояния (state machine)
             int stateVarIndex = -1;
             object? initialState = null;
 
@@ -395,16 +438,7 @@ namespace Deobfuscator
                 return false;
             }
 
-            // 2. Строим полную карту переходов состояний.
-            // Ищем все конструкции вида:
-            // ldloc state
-            // ldc value_X
-            // ceq
-            // brfalse SKIP_TARGET
-            // ... ПОЛЕЗНЫЙ КОД ...
-            // ldc next_value_Y
-            // stloc state
-            // SKIP_TARGET:
+            // 3. Строим карту переходов состояний
             var stateMap = new Dictionary<object, Tuple<object?, List<Instruction>>>();
 
             for (int i = 0; i < instructions.Count - 4; i++)
@@ -423,11 +457,9 @@ namespace Deobfuscator
                         if (skipTarget == null) continue;
 
                         // Извлекаем блок кода между branchInstr и skipTarget
-                        // Этот блок должен содержать полезную логику и обновление состояния
-                        var block = ExtractUsefulCodeBlock(instructions, instructions[i + 4], skipTarget, stateVarIndex, out object? nextState);
+                        // Передаем returnVarIndex, чтобы экстрактор знал, какую переменную отслеживать
+                        var block = ExtractUsefulCodeBlock(instructions, instructions[i + 4], skipTarget, stateVarIndex, returnVarIndex, out object? nextState);
 
-                        // Добавляем в карту, даже если блок кажется пустым (возможно только переход состояния)
-                        // Но мы ожидаем, что nextState будет найден
                         if (!stateMap.ContainsKey(checkVal))
                         {
                             stateMap[checkVal] = Tuple.Create(nextState, block);
@@ -454,12 +486,15 @@ namespace Deobfuscator
                 return false;
             }
 
-            // 3. Эмуляция выполнения - проходим по цепочке состояний от начального до конечного
+            // 4. Эмуляция выполнения
             var finalInstructions = new List<Instruction>();
             var currentState = initialState;
             var visitedStates = new HashSet<object>();
             int maxIterations = stateMap.Count * 3 + 10;
             int iteration = 0;
+            
+            // Отслеживаем, было ли найдено присваивание возвращаемой переменной
+            bool returnValueAssigned = (returnVarIndex == -1); // Если void, считаем что всё ок
 
             Log($"Starting loop emulation from state {currentState}, total transitions: {stateMap.Count}");
 
@@ -467,7 +502,6 @@ namespace Deobfuscator
             {
                 iteration++;
 
-                // Защита от зацикливания
                 if (visitedStates.Contains(currentState))
                 {
                     Log($"Detected cycle at state {currentState}, stopping emulation");
@@ -489,13 +523,18 @@ namespace Deobfuscator
 
                     Log($"Iteration {iteration}: Processing state {currentState}, adding {block.Count} useful instructions");
 
-                    // Добавляем ТОЛЬКО полезные инструкции блока
                     foreach (var ins in block)
                     {
                         finalInstructions.Add(CloneInstruction(ins));
+                        
+                        // Проверяем, не записали ли мы значение в возвращаемую переменную
+                        if (returnVarIndex != -1 && IsStloc(ins, out int sIdx) && sIdx == returnVarIndex)
+                        {
+                            returnValueAssigned = true;
+                            Log($"  -> Found assignment to return variable V_{returnVarIndex}");
+                        }
                     }
 
-                    // Переходим к следующему состоянию
                     if (nextState == null)
                     {
                         Log("Next state is null, stopping");
@@ -517,7 +556,14 @@ namespace Deobfuscator
                 return false;
             }
 
-            // 4. Добавляем ret если его нет в конце
+            // ВАЖНАЯ ПРОВЕРКА: Если метод должен возвращать значение, но мы его не нашли в блоках
+            if (!returnValueAssigned)
+            {
+                Log($"CRITICAL: Return variable V_{returnVarIndex} was never assigned! Restoring method to avoid corruption.");
+                return false;
+            }
+
+            // 5. Добавляем ret если его нет в конце
             var lastInstr = finalInstructions.LastOrDefault();
             if (lastInstr == null || (lastInstr.OpCode.Code != Code.Ret && lastInstr.OpCode.Code != Code.Throw))
             {
@@ -531,11 +577,10 @@ namespace Deobfuscator
 
         /// <summary>
         /// Извлекает ТОЛЬКО полезный код из блока между startInstr и endMarker (exclusive).
-        /// Исключает все инструкции управления состоянием (ldloc state, ldc const, ceq, br, stloc state).
-        /// Также пытается найти новое значение состояния (stloc state) в конце блока.
+        /// returnVarIndex используется для приоритизации инструкций, записывающих в возвращаемую переменную.
         /// </summary>
         private List<Instruction> ExtractUsefulCodeBlock(IList<Instruction> allInstructions, Instruction startInstr, 
-                                                            Instruction endMarker, int stateVarIndex, out object? nextState)
+                                                            Instruction endMarker, int stateVarIndex, int returnVarIndex, out object? nextState)
         {
             var usefulCode = new List<Instruction>();
             nextState = null;
@@ -549,7 +594,7 @@ namespace Deobfuscator
                 return usefulCode;
             }
 
-            Log($"  Extracting block from index {startIndex} to {endIndex}");
+            Log($"  Extracting block from index {startIndex} to {endIndex}. ReturnVar: V_{returnVarIndex}");
 
             for (int i = startIndex; i < endIndex; i++)
             {
@@ -567,8 +612,7 @@ namespace Deobfuscator
                     continue;
                 }
 
-                // 3. Пропускаем константы, используемые для сравнения (ldc.i4 / ldc.r8 перед ceq)
-                // Обычно это часть проверки условия, которая уже обработана логикой эмулятора
+                // 3. Обработка констант
                 if ((instr.OpCode.Code == Code.Ldc_I4 || instr.OpCode.Code == Code.Ldc_I8 || instr.OpCode.Code == Code.Ldc_R4 || instr.OpCode.Code == Code.Ldc_R8) &&
                     i + 2 < endIndex)
                 {
@@ -583,7 +627,7 @@ namespace Deobfuscator
                         continue;
                     }
                     
-                    // Если за константой следует stloc состояния - это обновление состояния, сохраняем значение, но не инструкцию
+                    // Если за константой следует stloc состояния - это обновление состояния
                     if (IsStloc(next, out int sIdx) && sIdx == stateVarIndex)
                     {
                         nextState = GetConstantValue(instr);
@@ -592,7 +636,7 @@ namespace Deobfuscator
                     }
                 }
 
-                // 4. Пропускаем сравнения и ветвления внутри блока (они уже учтены структурой)
+                // 4. Пропускаем сравнения и ветвления внутри блока
                 if (instr.OpCode.Code == Code.Ceq || instr.OpCode.Code == Code.Cgt || instr.OpCode.Code == Code.Clt ||
                     instr.OpCode.Code == Code.Brtrue || instr.OpCode.Code == Code.Brtrue_S ||
                     instr.OpCode.Code == Code.Brfalse || instr.OpCode.Code == Code.Brfalse_S ||
@@ -601,15 +645,24 @@ namespace Deobfuscator
                     continue;
                 }
 
-                // 5. Пропускаем запись в переменную состояния (stloc state), так как мы уже извлекли значение выше
+                // 5. Пропускаем запись в переменную состояния (stloc state)
                 if (IsStloc(instr, out int stIdx) && stIdx == stateVarIndex)
                 {
                     continue;
                 }
 
-                // 6. Всё остальное - полезный код (вызовы методов, арифметика, работа с другими локальными переменными)
+                // 6. Всё остальное - полезный код
+                // ОСОБЕННО ВАЖНО: сохраняем stloc returnVarIndex
                 usefulCode.Add(CloneInstruction(instr));
-                Log($"  Added useful: {instr}");
+                
+                if (returnVarIndex != -1 && IsStloc(instr, out int rIdx) && rIdx == returnVarIndex)
+                {
+                    Log($"  Added CRITICAL instruction (return val): {instr}");
+                }
+                else
+                {
+                    Log($"  Added useful: {instr}");
+                }
             }
 
             Log($"  Extracted {usefulCode.Count} useful instructions. NextState: {nextState}");
@@ -631,7 +684,6 @@ namespace Deobfuscator
             {
                 var instr = allInstructions[ip];
 
-                // Проверяем на достижение конца блока - встречаем запись в stateVar
                 if (ip + 1 < allInstructions.Count)
                 {
                     var nextIns = allInstructions[ip + 1];
@@ -647,27 +699,15 @@ namespace Deobfuscator
                     }
                 }
 
-                // Если дошли до ret - добавляем и выходим
-                if (instr.OpCode.Code == Code.Ret)
+                if (instr.OpCode.Code == Code.Ret || instr.OpCode.Code == Code.Throw)
                 {
                     block.Add(CloneInstruction(instr));
-                    Log($"    Block ends with ret");
+                    Log($"    Block ends with ret/throw");
                     break;
                 }
 
-                // Если дошли до throw - добавляем и выходим
-                if (instr.OpCode.Code == Code.Throw)
-                {
-                    block.Add(CloneInstruction(instr));
-                    Log($"    Block ends with throw");
-                    break;
-                }
-
-                // Добавляем инструкцию в блок (включая почти всё)
-                // Пропускаем только загрузки переменной состояния
                 bool shouldSkip = false;
 
-                // Пропускаем только загрузку переменной состояния
                 if (GetLocalIndex(instr) == stateVarIndex &&
                    (instr.OpCode.Code == Code.Ldloc || instr.OpCode.Code == Code.Ldloc_S ||
                     (instr.OpCode.Code >= Code.Ldloc_0 && instr.OpCode.Code <= Code.Ldloc_3)))
@@ -676,8 +716,6 @@ namespace Deobfuscator
                     Log($"    [Skip] State load: {instr}");
                 }
 
-                // НЕ пропускаем сравнения и ветвления - они могут быть частью логики
-                // Пропускаем только если это явно часть механизма state machine
                 if (!shouldSkip)
                 {
                     block.Add(CloneInstruction(instr));
@@ -689,7 +727,6 @@ namespace Deobfuscator
 
                 ip++;
 
-                // Защита от бесконечного цикла
                 if (block.Count > maxBlockLen)
                 {
                     Log($"    Block exceeded max length ({maxBlockLen}), stopping");
@@ -737,10 +774,9 @@ namespace Deobfuscator
 
                 for (int i = 0; i < instructions.Count - 1; i++)
                 {
-                    var instr = instructions[i];
                     if (IsStloc(instructions[i + 1], out int idx))
                     {
-                        var val = GetConstantValue(instr);
+                        var val = GetConstantValue(instructions[i]);
                         if (val != null) knownValues[idx] = val;
                     }
                 }
