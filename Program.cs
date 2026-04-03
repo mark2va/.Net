@@ -1,94 +1,88 @@
 using System;
 using System.IO;
+using System.Linq;
 
 namespace Deobfuscator
 {
     class Program
     {
-        static int Main(string[] args)
+        static void Main(string[] args)
         {
-            Console.WriteLine("=== Universal .NET Deobfuscator ===");
-            Console.WriteLine("Based on dnlib");
-            Console.WriteLine();
-
             if (args.Length < 1)
             {
-                PrintUsage();
-                return 1;
+                Console.WriteLine("Usage: deobfuscator.exe <input_file> [--ai] [--debug]");
+                Console.WriteLine("  --ai     Enable AI renaming (requires local Ollama running)");
+                Console.WriteLine("  --debug  Enable detailed logging to console and file");
+                return;
             }
 
-            string inputFile = args[0];
-            string outputFile;
+            string filePath = args[0];
+            bool enableAi = args.Contains("--ai");
+            bool debugMode = args.Contains("--debug");
 
-            if (args.Length >= 2)
+            if (!File.Exists(filePath))
             {
-                outputFile = args[1];
+                Console.WriteLine($"[!] Error: File not found: {filePath}");
+                return;
+            }
+
+            // Настройка AI
+            AiConfig aiConfig = new AiConfig();
+            if (enableAi)
+            {
+                aiConfig.Enabled = true;
+                Console.WriteLine("[*] Initializing AI Assistant...");
+                
+                // Проверка подключения до начала работы
+                using (var tempAssistant = new AiAssistant(aiConfig))
+                {
+                    if (!tempAssistant.IsConnected)
+                    {
+                        Console.WriteLine("[!] Error: Cannot connect to local AI model (Ollama).");
+                        Console.WriteLine("    Make sure Ollama is running: ollama serve");
+                        Console.WriteLine("    Continuing without AI features...");
+                        aiConfig.Enabled = false;
+                    }
+                    else
+                    {
+                        Console.WriteLine($"[+] Connected to AI model: {aiConfig.ModelName}");
+                    }
+                }
             }
             else
             {
-                // Генерация имени выходного файла
-                string dir = Path.GetDirectoryName(inputFile) ?? "";
-                string name = Path.GetFileNameWithoutExtension(inputFile);
-                string ext = Path.GetExtension(inputFile);
-                outputFile = Path.Combine(dir, name + "_deob" + ext);
-                Console.WriteLine($"[*] Output file not specified. Using: {outputFile}");
+                aiConfig.Enabled = false;
             }
 
-            if (!File.Exists(inputFile))
-            {
-                Console.WriteLine($"[Error] File not found: {inputFile}");
-                return 1;
-            }
-
-            var aiConfig = new AiConfig();
-            
-            // Парсинг аргументов начиная с 1 (так как 0 - это входной файл)
-            for (int i = 1; i < args.Length; i++)
-            {
-                switch (args[i])
-                {
-                    case "--ai":
-                        aiConfig.Enabled = true;
-                        break;
-                    case "--ai-url":
-                        if (i + 1 < args.Length) aiConfig.ApiUrl = args[++i];
-                        break;
-                    case "--ai-model":
-                        if (i + 1 < args.Length) aiConfig.Model = args[++i];
-                        break;
-                    case "--ai-timeout":
-                        if (i + 1 < args.Length && int.TryParse(args[++i], out int t))
-                            aiConfig.TimeoutSeconds = t;
-                        break;
-                }
-            }
+            string outputPath = Path.Combine(
+                Path.GetDirectoryName(filePath) ?? Directory.GetCurrentDirectory(),
+                Path.GetFileNameWithoutExtension(filePath) + "_deob.exe"
+            );
 
             try
             {
-                using (var deobfuscator = new UniversalDeobfuscator(inputFile, aiConfig))
+                Console.WriteLine($"[*] Loading: {filePath}");
+                
+                using (var deobfuscator = new UniversalDeobfuscator(filePath, aiConfig, debugMode))
                 {
                     deobfuscator.Deobfuscate();
-                    deobfuscator.Save(outputFile);
+                    deobfuscator.Save(outputPath);
                 }
-                return 0;
+
+                Console.WriteLine($"[+] Successfully saved to: {outputPath}");
+                if (debugMode)
+                {
+                    Console.WriteLine($"[+] Debug log saved to: {Path.Combine(Path.GetDirectoryName(filePath) ?? "", "deob_log.txt")}");
+                }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Fatal Error]: {ex.Message}");
-                Console.WriteLine(ex.StackTrace);
-                return 1;
+                Console.WriteLine($"[!] Fatal Error: {ex.Message}");
+                if (debugMode)
+                {
+                    Console.WriteLine(ex.StackTrace);
+                }
             }
-        }
-
-        static void PrintUsage()
-        {
-            Console.WriteLine("Usage: Deobfuscator.exe <input.exe> [output.exe] [options]");
-            Console.WriteLine();
-            Console.WriteLine("Options:");
-            Console.WriteLine("  --ai                 Enable AI renaming");
-            Console.WriteLine("  --ai-url <url>       AI Server URL (default: http://localhost:11434)");
-            Console.WriteLine("  --ai-model <name>    Model name (default: llama3)");
-            Console.WriteLine("  --ai-timeout <sec>   Request timeout (default: 120)");
         }
     }
 }
