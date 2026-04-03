@@ -2,7 +2,6 @@ using System;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
-using System.Threading.Tasks;
 
 namespace Deobfuscator
 {
@@ -11,6 +10,7 @@ namespace Deobfuscator
         private readonly HttpClient _httpClient;
         private readonly AiConfig _config;
         private bool _isConnected;
+        private bool _useOpenAiFormat; // Флаг для переключения формата
 
         public AiAssistant(AiConfig config)
         {
@@ -26,115 +26,182 @@ namespace Deobfuscator
             {
                 Timeout = TimeSpan.FromSeconds(config.TimeoutSeconds)
             };
-            
-            // Формируем правильный URL для API
-            string baseUrl = _config.ApiUrl.TrimEnd('/');
-            if (!baseUrl.Contains("/api/"))
-            {
-                _endpoint = $"{baseUrl}/api/generate";
-            }
-            else
-            {
-                _endpoint = baseUrl;
-            }
-            
-            Console.WriteLine($"[AI] Initialized with endpoint: {_endpoint}");
-            _isConnected = CheckConnectionAsync().Result;
-            
-            if (_isConnected)
-            {
-                Console.WriteLine($"[AI] Successfully connected to Ollama server.");
-            }
-            else
-            {
-                Console.WriteLine($"[AI] Warning: Cannot connect to Ollama server at {_endpoint}");
-                Console.WriteLine("[AI] Make sure Ollama is running: ollama serve");
-            }
+
+            // Проверяем подключение и определяем формат API
+            _isConnected = InitializeConnectionAsync().Result;
         }
-        
-        private readonly string _endpoint;
 
         public bool IsConnected => _isConnected;
 
-        private async System.Threading.Tasks.Task<bool> CheckConnectionAsync()
+        private async System.Threading.Tasks.Task<bool> InitializeConnectionAsync()
         {
             try
             {
-                var rootUrl = _endpoint.Replace("/api/generate", "");
+                // Пробуем стандартный путь Ollama
+                var rootUrl = _config.ApiUrl.Replace("/api/generate", "").Replace("/v1/completions", "").TrimEnd('/');
+                
+                // Сначала пробуем получить информацию о сервере (Ollama style)
                 var response = await _httpClient.GetAsync(rootUrl);
-                return response.IsSuccessStatusCode;
+                if (response.IsSuccessStatusCode)
+                {
+                    Console.WriteLine($"[AI] Connected to server at {rootUrl}");
+                    
+                    // Пробуем сделать тестовый запрос к генерации, чтобы проверить путь
+                    // Если /api/generate не работает, попробуем /v1/completions
+                    if (!await TestGenerationEndpoint(rootUrl + "/api/generate"))
+                    {
+                        Console.WriteLine("[AI] /api/generate not found (404). Trying OpenAI compatible endpoint /v1/completions...");
+                        if (await TestGenerationEndpoint(rootUrl + "/v1/completions"))
+                        {
+                            _useOpenAiFormat = true;
+                            _config.ApiUrl = rootUrl + "/v1/completions";
+                            Console.WriteLine($"[AI] Switched to OpenAI format: {_config.ApiUrl}");
+                            return true;
+                        }
+                        return false;
+                    }
+                    
+                    _useOpenAiFormat = false;
+                    _config.ApiUrl = rootUrl + "/api/generate";
+                    return true;
+                }
+                return false;
             }
-            catch (Exception)
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[AI] Connection error: {ex.Message}");
+                return false;
+            }
+        }
+
+        private async System.Threading.Tasks.Task<bool> TestGenerationEndpoint(string url)
+        {
+            try
+            {
+                var payload = _useOpenAiFormat 
+                    ? new { model = _config.ModelName, prompt = "hi", max_tokens = 5 }
+                    : new { model = _config.ModelName, prompt = "hi", stream = false };
+                
+                var json = JsonSerializer.Serialize(payload);
+                var content = new StringContent(json, Encoding.UTF8, "application/json");
+                
+                var response = await _httpClient.PostAsync(url, content);
+                
+                // Считаем успехом 200 OK. 404 означает неверный путь.
+                return response.StatusCode == System.Net.HttpStatusCode.OK;
+            }
+            catch
             {
                 return false;
             }
         }
 
-        public string? GetSuggestedName(string currentName, string ilSnippet, string returnType)
+        public string GetSuggestedName(string currentName, string codeSnippet, string? returnType)
         {
             if (!_isConnected)
             {
-                Console.WriteLine("[AI] Not connected to server, skipping rename request.");
-                return null;
+                return currentName;
             }
 
             try
             {
-                var prompt = $@"Analyze this obfuscated C# method and suggest a meaningful name.
-Return ONLY the name, no explanation.
-Return Type: {returnType}
-Current Name: {currentName}
-IL Code:
-{ilSnippet}
+                var prompt = $@"Analyze this obfuscated C# method and suggest a clear, descriptive name in English (PascalCase). 
+Do not output any explanation, just the name.
+Return type: {returnType ?? "void"}
+Current name: {currentName}
+
+Code snippet:
+{codeSnippet}
 
 Suggested name:";
 
-                var payload = new
+                string json;
+                if (_useOpenAiFormat)
                 {
-                    model = _config.Model,
-                    prompt = prompt,
-                    stream = false,
-                    options = new { temperature = 0.1 }
-                };
-
-                var json = JsonSerializer.Serialize(payload);
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-                Console.WriteLine($"[AI] Sending request to {_endpoint}...");
-                var response = _httpClient.PostAsync(_endpoint, content).Result;
-                
-                if (response.IsSuccessStatusCode)
-                {
-                    var responseString = response.Content.ReadAsStringAsync().Result;
-                    using var doc = JsonDocument.Parse(responseString);
-                    if (doc.RootElement.TryGetProperty("response", out var el))
+                    // Формат OpenAI / vLLM / LocalAI
+                    var payload = new
                     {
-                        var name = el.GetString()?.Trim();
-                        if (!string.IsNullOrEmpty(name))
-                        {
-                            Console.WriteLine($"[AI] Received suggestion: {name}");
-                            return name;
-                        }
-                    }
-                    Console.WriteLine("[AI] Empty response from server.");
+                        model = _config.ModelName,
+                        prompt = prompt,
+                        max_tokens = 50,
+                        temperature = 0.3,
+                        stream = false
+                    };
+                    json = JsonSerializer.Serialize(payload);
                 }
                 else
                 {
-                    Console.WriteLine($"[AI] HTTP Error: {response.StatusCode} - {response.ReasonPhrase}");
+                    // Формат Ollama
+                    var payload = new
+                    {
+                        model = _config.ModelName,
+                        prompt = prompt,
+                        stream = false,
+                        options = new
+                        {
+                            temperature = 0.3,
+                            num_predict = 50
+                        }
+                    };
+                    json = JsonSerializer.Serialize(payload);
                 }
-            }
-            catch (AggregateException ae) when (ae.InnerException is HttpRequestException hre)
-            {
-                Console.WriteLine($"[AI] Connection failed: {hre.Message}");
-                Console.WriteLine("[AI] Make sure Ollama server is running at the specified URL.");
-                _isConnected = false;
+
+                var content = new StringContent(json, Encoding.UTF8, "application/json");
+                var response = _httpClient.PostAsync(_config.ApiUrl, content).Result;
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var responseString = response.Content.ReadAsStringAsync().Result;
+                    
+                    string? resultText = null;
+                    
+                    if (_useOpenAiFormat)
+                    {
+                        // Парсинг ответа OpenAI: {"choices": [{"text": "..."}]}
+                        using var doc = JsonDocument.Parse(responseString);
+                        if (doc.RootElement.TryGetProperty("choices", out var choices) && choices.GetArrayLength() > 0)
+                        {
+                            if (choices[0].TryGetProperty("text", out var textElem))
+                            {
+                                resultText = textElem.GetString();
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Парсинг ответа Ollama: {"response": "..."}
+                        using var doc = JsonDocument.Parse(responseString);
+                        if (doc.RootElement.TryGetProperty("response", out var element))
+                        {
+                            resultText = element.GetString();
+                        }
+                    }
+
+                    if (!string.IsNullOrEmpty(resultText))
+                    {
+                        return CleanName(resultText);
+                    }
+                }
+                else
+                {
+                    var errContent = response.Content.ReadAsStringAsync().Result;
+                    Console.WriteLine($"[AI] API Error {(int)response.StatusCode}: {errContent}");
+                }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[AI] Request failed: {ex.Message}");
+                Console.WriteLine($"[AI] Request error: {ex.Message}");
                 _isConnected = false;
             }
-            return null;
+
+            return currentName;
+        }
+
+        private string CleanName(string rawName)
+        {
+            var clean = rawName.Replace("\"", "").Replace(";", "").Replace("`", "").Trim();
+            var parts = clean.Split(new[] { ' ', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+            return parts.Length > 0 ? parts[0] : clean;
         }
 
         public void Dispose()
