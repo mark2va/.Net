@@ -73,7 +73,7 @@ namespace Deobfuscator
                     _indentLevel++;
                     
                     var backupInstructions = method.Body.Instructions.ToList();
-                    var backupLocals = method.Body.Variables.ToList();
+                    var backupVariables = method.Body.Variables.ToList();
                     int originalCount = backupInstructions.Count;
                     Log($"Original instructions: {originalCount}");
 
@@ -93,21 +93,25 @@ namespace Deobfuscator
                             _indentLevel--;
                         }
                         
-                        // Пробуем новый подход: поиск и удаление мусорных state-машин
-                        if (originalCount > 10)
+                        // Только если метод действительно выглядит как state machine
+                        if (originalCount > 10 && IsDefinitelyStateMachine(method))
                         {
-                            Log("Analyzing for obfuscated state machine patterns...");
-                            bool unpacked = UnpackStateMachineByContent(method);
-                            
+                            Log("Method is definitely a state machine, attempting to unpack...");
+                            bool unpacked = UnpackStateMachineSafe(method);
                             if (unpacked)
                             {
                                 wasModified = true;
-                                Log($"State machine unpacked by content analysis. Instructions: {originalCount} -> {method.Body.Instructions.Count}");
+                                Log($"State machine unpacked. Instructions: {originalCount} -> {method.Body.Instructions.Count}");
                             }
                             else
                             {
-                                Log("No valid state machine pattern found or extraction failed.");
+                                Log("Unpacking failed, keeping original");
+                                RestoreMethod(method, backupInstructions, backupVariables);
                             }
+                        }
+                        else
+                        {
+                            Log("Not a state machine, skipping unpacking");
                         }
                         
                         // Проверяем, не стал ли метод пустым или битым
@@ -115,7 +119,7 @@ namespace Deobfuscator
                         {
                             emptyMethods++;
                             Log($"WARNING: Method became empty! Restoring original...");
-                            RestoreMethod(method, backupInstructions, backupLocals);
+                            RestoreMethod(method, backupInstructions, backupVariables);
                             wasModified = false;
                         }
                         else if (wasModified)
@@ -141,7 +145,7 @@ namespace Deobfuscator
                         Console.WriteLine(err);
                         Log(err);
                         Log($"Restoring original method...");
-                        RestoreMethod(method, backupInstructions, backupLocals);
+                        RestoreMethod(method, backupInstructions, backupVariables);
                     }
                     
                     _indentLevel--;
@@ -154,21 +158,224 @@ namespace Deobfuscator
             Log("=== Deobfuscation Finished ===");
         }
 
+        private bool IsDefinitelyStateMachine(MethodDef method)
+        {
+            var instructions = method.Body.Instructions;
+            if (instructions.Count < 20) return false;
+            
+            int statePatterns = 0;
+            int switchInstructions = 0;
+            
+            for (int i = 0; i < instructions.Count - 3; i++)
+            {
+                // Паттерн: загрузка переменной состояния + сравнение + ветвление
+                if (IsLdloc(instructions[i], out int idx) &&
+                    GetConstantValue(instructions[i + 1]) != null &&
+                    (instructions[i + 2].OpCode.Code == Code.Ceq || 
+                     instructions[i + 2].OpCode.Code == Code.Cgt ||
+                     instructions[i + 2].OpCode.Code == Code.Clt) &&
+                    (instructions[i + 3].OpCode.Code == Code.Brtrue ||
+                     instructions[i + 3].OpCode.Code == Code.Brfalse))
+                {
+                    statePatterns++;
+                }
+                
+                // Паттерн: switch
+                if (instructions[i].OpCode.Code == Code.Switch)
+                {
+                    switchInstructions++;
+                }
+            }
+            
+            return statePatterns >= 3 || switchInstructions > 0;
+        }
+
+        private bool UnpackStateMachineSafe(MethodDef method)
+        {
+            var backupInstr = method.Body.Instructions.ToList();
+            var backupVars = method.Body.Variables.ToList();
+            
+            try
+            {
+                bool result = UnpackStateMachine(method);
+                
+                if (result && method.Body.Instructions.Count > 0)
+                {
+                    var lastInstr = method.Body.Instructions.LastOrDefault();
+                    if (lastInstr != null && 
+                        lastInstr.OpCode.Code != Code.Ret && 
+                        lastInstr.OpCode.Code != Code.Throw)
+                    {
+                        Log("Method doesn't end with ret/throw, adding ret...");
+                        method.Body.Instructions.Add(Instruction.Create(OpCodes.Ret));
+                        method.Body.UpdateInstructionOffsets();
+                    }
+                    
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"UnpackStateMachine failed: {ex.Message}");
+                RestoreMethod(method, backupInstr, backupVars);
+            }
+            
+            return false;
+        }
+
+        private bool UnpackStateMachine(MethodDef method)
+        {
+            var body = method.Body;
+            if (body == null || body.Instructions.Count < 5) return false;
+
+            var instructions = body.Instructions;
+            
+            // Сначала пробуем новый подход с эмуляцией запутанных циклов
+            if (TryEmulateObfuscatedLoops(method))
+            {
+                Log("Successfully emulated obfuscated loops");
+                return true;
+            }
+            
+            // Старая логика (резерв)
+            Log("New loop emulation failed, trying legacy state machine logic...");
+            
+            // 1. Поиск переменной состояния
+            int stateVarIndex = -1;
+            object? initialState = null;
+
+            for (int i = 0; i < Math.Min(15, instructions.Count - 1); i++)
+            {
+                if (IsStloc(instructions[i + 1], out int idx))
+                {
+                    var val = GetConstantValue(instructions[i]);
+                    if (val != null)
+                    {
+                        stateVarIndex = idx;
+                        initialState = val;
+                        Log($"Found state variable: V_{stateVarIndex}, Initial Value: {initialState}");
+                        break;
+                    }
+                }
+            }
+
+            if (stateVarIndex == -1 || initialState == null)
+            {
+                Log("No state variable found.");
+                return false;
+            }
+
+            // 2. Построение графа состояний
+            var stateBlocks = new Dictionary<object, List<Instruction>>();
+            var transitions = new Dictionary<object, object?>();
+            
+            for (int i = 0; i < instructions.Count - 4; i++)
+            {
+                var instr1 = instructions[i];
+                var instr2 = instructions[i+1];
+                var instr3 = instructions[i+2];
+                var instr4 = instructions[i+3];
+
+                if (GetLocalIndex(instr1) == stateVarIndex &&
+                    GetConstantValue(instr2) is object checkVal &&
+                    (instr3.OpCode.Code == Code.Ceq || instr3.OpCode.Code == Code.Cgt || instr3.OpCode.Code == Code.Clt) &&
+                    (instr4.OpCode.Code == Code.Brtrue || instr4.OpCode.Code == Code.Brtrue_S || 
+                     instr4.OpCode.Code == Code.Brfalse || instr4.OpCode.Code == Code.Brfalse_S))
+                {
+                    var target = instr4.Operand as Instruction;
+                    if (target != null)
+                    {
+                        var block = ExtractBlockImproved(instructions, target, stateVarIndex, out object? nextVal);
+                        
+                        if (!stateBlocks.ContainsKey(checkVal) && block.Count > 0)
+                        {
+                            stateBlocks[checkVal] = block;
+                            transitions[checkVal] = nextVal;
+                            Log($"Found block for state {checkVal}. Next state: {nextVal}. Instructions: {block.Count}");
+                        }
+                    }
+                }
+            }
+
+            if (stateBlocks.Count == 0)
+            {
+                Log("No state blocks found.");
+                return false;
+            }
+
+            // 3. Сборка линейного кода
+            var finalInstructions = new List<Instruction>();
+            var visited = new HashSet<object?>();
+            var queue = new Queue<object?>();
+
+            if (initialState != null) queue.Enqueue(initialState);
+
+            Log("Reconstructing linear flow...");
+
+            while (queue.Count > 0)
+            {
+                var currentState = queue.Dequeue();
+                if (visited.Contains(currentState)) continue;
+                visited.Add(currentState);
+                Log($"Processing state: {currentState}");
+
+                if (stateBlocks.TryGetValue(currentState, out var block))
+                {
+                    foreach (var ins in block)
+                    {
+                        finalInstructions.Add(CloneInstruction(ins));
+                    }
+                }
+
+                if (transitions.TryGetValue(currentState, out var nextVal) && nextVal != null)
+                {
+                    if (!visited.Contains(nextVal))
+                        queue.Enqueue(nextVal);
+                }
+            }
+
+            if (finalInstructions.Count == 0)
+            {
+                Log("Resulting instruction list is empty.");
+                return false;
+            }
+
+            Log($"Final instruction count: {finalInstructions.Count}");
+            ReplaceMethodBody(method, finalInstructions);
+            return true;
+        }
+
         /// <summary>
-        /// НОВЫЙ ПОДХОД: 
-        /// 1. Находим переменную состояния.
-        /// 2. Ищем все блоки кода, привязанные к условиям этой переменной.
-        /// 3. Анализируем содержимое блоков: если там есть вызовы методов (call) или возврат (ret/stloc результата) - блок полезный.
-        /// 4. Если блок содержит только математику над переменной состояния - это мусор (переход).
-        /// 5. Собираем новый метод только из полезных блоков в порядке логического выполнения.
+        /// Эмулирует выполнение запутанных циклов с переменной состояния.
+        /// Ключевое изменение: Анализ возвращаемого значения и фильтрация мусорных присваиваний.
         /// </summary>
-        private bool UnpackStateMachineByContent(MethodDef method)
+        private bool TryEmulateObfuscatedLoops(MethodDef method)
         {
             var body = method.Body;
             var instructions = body.Instructions;
-            if (instructions.Count < 15) return false;
+            if (instructions.Count < 10) return false;
 
-            // 1. Поиск переменной состояния (обычно инициализируется в начале)
+            // 1. АНАЛИЗ ВОЗВРАЩАЕМОГО ЗНАЧЕНИЯ
+            // Находим переменную, которая загружается перед ret. Это и есть результат метода.
+            int? returnVarIndex = null;
+            for (int i = instructions.Count - 1; i >= 0; i--)
+            {
+                if (instructions[i].OpCode.Code == Code.Ret)
+                {
+                    // Идем назад, пропуская nop
+                    int j = i - 1;
+                    while (j >= 0 && instructions[j].OpCode.Code == Code.Nop) j--;
+                    
+                    if (j >= 0 && IsLdloc(instructions[j], out int rIdx))
+                    {
+                        returnVarIndex = rIdx;
+                        Log($"Detected return variable: V_{returnVarIndex}");
+                        break;
+                    }
+                }
+            }
+
+            // 2. Поиск инициализации переменной состояния
             int stateVarIndex = -1;
             object? initialState = null;
 
@@ -181,7 +388,7 @@ namespace Deobfuscator
                     {
                         stateVarIndex = idx;
                         initialState = val;
-                        Log($"Found state variable: V_{stateVarIndex}, Initial: {initialState}");
+                        Log($"Found loop state variable: V_{stateVarIndex}, Initial: {initialState}");
                         break;
                     }
                 }
@@ -189,100 +396,45 @@ namespace Deobfuscator
 
             if (stateVarIndex == -1 || initialState == null)
             {
-                Log("No clear state variable initialization found.");
+                Log("No loop state variable found.");
                 return false;
             }
 
-            // 2. Карта состояний: StateValue -> (NextStateValue, List<UsefulInstructions>)
+            // 3. Строим карту переходов
             var stateMap = new Dictionary<object, Tuple<object?, List<Instruction>>>();
-            
-            // Проходим по всем инструкциям в поисках паттерна проверки состояния
-            // Паттерн: ldloc state, ldc checkVal, ceq/clt/cgt, brfalse target_skip
+
             for (int i = 0; i < instructions.Count - 4; i++)
             {
                 if (GetLocalIndex(instructions[i]) == stateVarIndex &&
                     GetConstantValue(instructions[i + 1]) is object checkVal)
                 {
-                    var cmp = instructions[i + 2];
-                    var branch = instructions[i + 3];
+                    var cmpInstr = instructions[i + 2];
+                    var branchInstr = instructions[i + 3];
 
-                    if ((cmp.OpCode.Code == Code.Ceq || cmp.OpCode.Code == Code.Cgt || cmp.OpCode.Code == Code.Clt) &&
-                        (branch.OpCode.Code == Code.Brfalse || branch.OpCode.Code == Code.Brfalse_S))
+                    if ((cmpInstr.OpCode.Code == Code.Ceq || cmpInstr.OpCode.Code == Code.Cgt || cmpInstr.OpCode.Code == Code.Clt) &&
+                        (branchInstr.OpCode.Code == Code.Brfalse || branchInstr.OpCode.Code == Code.Brfalse_S))
                     {
-                        var skipTarget = branch.Operand as Instruction;
+                        var skipTarget = branchInstr.Operand as Instruction;
                         if (skipTarget == null) continue;
 
-                        // Блок кода находится между инструкцией после ветвления (i+4) и целевой инструкцией пропуска
-                        int blockStartIdx = i + 4;
-                        int blockEndIdx = instructions.IndexOf(skipTarget);
+                        // Передаем returnVarIndex в экстрактор, чтобы он знал, что сохранять
+                        var block = ExtractUsefulCodeBlock(instructions, instructions[i + 4], skipTarget, stateVarIndex, returnVarIndex, out object? nextState);
 
-                        if (blockStartIdx >= blockEndIdx || blockStartIdx >= instructions.Count) continue;
-
-                        // Анализируем блок
-                        var blockInstrs = new List<Instruction>();
-                        for (int k = blockStartIdx; k < blockEndIdx; k++)
+                        if (!stateMap.ContainsKey(checkVal))
                         {
-                            blockInstrs.Add(instructions[k]);
-                        }
+                            stateMap[checkVal] = Tuple.Create(nextState, block);
+                            Log($"Found transition: state == {checkVal} -> next: {nextState}, useful instructions: {block.Count}");
 
-                        // ПРОВЕРКА НА ПОЛЕЗНОСТЬ
-                        // Блок полезен, если содержит: call, callvirt, ret, stloc (не в переменную состояния)
-                        bool isUseful = false;
-                        object? nextStateUpdate = null;
-
-                        foreach (var ins in blockInstrs)
-                        {
-                            if (ins.OpCode.Code == Code.Call || ins.OpCode.Code == Code.Callvirt || ins.OpCode.Code == Code.Newobj)
+                            if (_debugMode && block.Count > 0)
                             {
-                                isUseful = true;
-                                Log($"  State {checkVal}: Found CALL instruction -> Useful block detected.");
-                            }
-                            
-                            // Проверка на возврат значения
-                            if (ins.OpCode.Code == Code.Ret)
-                            {
-                                isUseful = true;
-                            }
-
-                            // Проверка на запись в локальную переменную (кроме переменной состояния)
-                            if (IsStloc(ins, out int sIdx))
-                            {
-                                if (sIdx != stateVarIndex)
+                                _indentLevel++;
+                                foreach (var ins in block.Take(10))
                                 {
-                                    isUseful = true; // Запись в другую переменную - это полезно
+                                    Log($"  {ins}");
                                 }
-                                else
-                                {
-                                    // Это обновление состояния, запоминаем следующее значение
-                                    // Ищем константу перед этим stloc
-                                    int idxInBlock = blockInstrs.IndexOf(ins);
-                                    if (idxInBlock > 0)
-                                    {
-                                        var prev = blockInstrs[idxInBlock - 1];
-                                        nextStateUpdate = GetConstantValue(prev);
-                                    }
-                                }
+                                if (block.Count > 10) Log($"  ... and {block.Count - 10} more");
+                                _indentLevel--;
                             }
-                        }
-
-                        // Если блок НЕ полезен (нет вызовов, нет записей в другие переменные), но есть переход состояния
-                        // Это значит, что блок был чисто для запутывания (мусорное условие), но нам нужно знать переход
-                        if (!isUseful && nextStateUpdate != null)
-                        {
-                            Log($"  State {checkVal}: Useless logic block (only state transition to {nextStateUpdate}). Extracting empty.");
-                            stateMap[checkVal] = Tuple.Create(nextStateUpdate, new List<Instruction>());
-                        }
-                        else if (isUseful)
-                        {
-                            // Извлекаем только полезные инструкции, выкидывая мусор внутри блока
-                            var cleanBlock = FilterJunkFromBlock(blockInstrs, stateVarIndex, out object? nextValFromClean);
-                            
-                            // Приоритет: если нашли nextStateUpdate при сканировании всего блока, используем его. 
-                            // Иначе берем то, что нашел фильтр.
-                            var finalNextState = nextStateUpdate ?? nextValFromClean;
-
-                            stateMap[checkVal] = Tuple.Create(finalNextState, cleanBlock);
-                            Log($"  State {checkVal}: Useful block extracted ({cleanBlock.Count} instrs). Next: {finalNextState}");
                         }
                     }
                 }
@@ -290,160 +442,259 @@ namespace Deobfuscator
 
             if (stateMap.Count == 0)
             {
-                Log("No state transitions with recognizable patterns found.");
+                Log("No state transitions found in loop pattern.");
                 return false;
             }
 
-            // 3. Сборка линейного кода путем прохода по цепочке состояний
+            // 4. Эмуляция выполнения
             var finalInstructions = new List<Instruction>();
             var currentState = initialState;
-            var visited = new HashSet<object>();
-            int maxIter = stateMap.Count * 3 + 10;
-            int iter = 0;
+            var visitedStates = new HashSet<object>();
+            int maxIterations = stateMap.Count * 3 + 10;
+            int iteration = 0;
+            bool returnValueAssigned = false;
 
-            Log($"Reconstructing flow starting from {initialState}...");
+            Log($"Starting loop emulation from state {currentState}");
 
-            while (iter < maxIter)
+            while (iteration < maxIterations)
             {
-                iter++;
-                if (currentState == null || visited.Contains(currentState))
-                {
-                    Log($"Loop detected or null state at {currentState}. Stopping.");
-                    break;
-                }
-                visited.Add(currentState);
+                iteration++;
 
-                if (stateMap.TryGetValue(currentState, out var data))
-                {
-                    var nextSt = data.Item1;
-                    var block = data.Item2;
+                if (visitedStates.Contains(currentState) || currentState == null) break;
+                visitedStates.Add(currentState);
 
-                    // Добавляем полезные инструкции
+                if (stateMap.TryGetValue(currentState, out var transition))
+                {
+                    var nextState = transition.Item1;
+                    var block = transition.Item2;
+
                     foreach (var ins in block)
                     {
                         finalInstructions.Add(CloneInstruction(ins));
+                        // Отслеживаем, было ли присваивание в переменную возврата
+                        if (returnVarIndex.HasValue && IsStloc(ins, out int sIdx) && sIdx == returnVarIndex.Value)
+                        {
+                            returnValueAssigned = true;
+                        }
                     }
 
-                    if (nextSt == null) break; // Конец цепочки
-                    currentState = nextSt;
+                    if (nextState == null) break;
+                    currentState = nextState;
                 }
                 else
                 {
-                    Log($"State {currentState} not found in map. Stopping.");
                     break;
                 }
             }
 
             if (finalInstructions.Count == 0)
             {
-                Log("Resulting method is empty. Aborting changes.");
+                Log("Emulation produced no instructions");
                 return false;
             }
 
-            // Добавляем ret, если нет
-            var last = finalInstructions.LastOrDefault();
-            if (last == null || (last.OpCode.Code != Code.Ret && last.OpCode.Code != Code.Throw))
+            // ВАЖНО: Если мы ожидали возврат значения, но присваивания не произошло, значит логика извлечения неверна
+            if (returnVarIndex.HasValue && !returnValueAssigned)
+            {
+                Log("WARNING: Return value was never assigned during emulation. Aborting to prevent corruption.");
+                return false;
+            }
+
+            // Добавляем ret если нет
+            var lastInstr = finalInstructions.LastOrDefault();
+            if (lastInstr == null || (lastInstr.OpCode.Code != Code.Ret && lastInstr.OpCode.Code != Code.Throw))
             {
                 finalInstructions.Add(Instruction.Create(OpCodes.Ret));
             }
 
-            // ВАЖНО: Сохраняем оригинальные локальные переменные, чтобы индексы совпадали
-            ReplaceMethodBodyPreservingLocals(method, finalInstructions);
-            
+            Log($"Emulation complete: {finalInstructions.Count} instructions extracted.");
+            ReplaceMethodBody(method, finalInstructions);
             return true;
         }
 
         /// <summary>
-        /// Очищает блок от внутреннего мусора (вложенных проверок состояния, nop, лишних загрузок)
-        /// Возвращает список чистых инструкций и найденное следующее состояние (если есть stloc state)
+        /// Извлекает полезный код, умно отфильтровывая мусор.
+        /// returnVarIndex: индекс переменной, которую МЕТОД ДОЛЖЕН ВЕРНУТЬ. Её присваивания СОХРАНЯЕМ.
+        /// stateVarIndex: индекс переменной цикла. Её присваивания УДАЛЯЕМ.
         /// </summary>
-        private List<Instruction> FilterJunkFromBlock(List<Instruction> block, int stateVarIndex, out object? nextState)
+        private List<Instruction> ExtractUsefulCodeBlock(IList<Instruction> allInstructions, Instruction startInstr, 
+                                                            Instruction endMarker, int stateVarIndex, int? returnVarIndex, out object? nextState)
         {
-            var clean = new List<Instruction>();
+            var usefulCode = new List<Instruction>();
             nextState = null;
 
-            for (int i = 0; i < block.Count; i++)
+            int startIndex = allInstructions.IndexOf(startInstr);
+            int endIndex = allInstructions.IndexOf(endMarker);
+
+            if (startIndex == -1 || endIndex == -1 || startIndex >= endIndex)
             {
-                var ins = block[i];
-
-                // Пропускаем Nop
-                if (ins.OpCode.Code == Code.Nop) continue;
-
-                // Пропускаем загрузки переменной состояния
-                if (GetLocalIndex(ins) == stateVarIndex) continue;
-
-                // Пропускаем константы, если они часть паттерна сравнения внутри блока
-                // (иногда обфускатор вставляет лишние проверки внутри полезного блока)
-                if ((ins.OpCode.Code == Code.Ldc_I4 || ins.OpCode.Code == Code.Ldc_R8) && i + 2 < block.Count)
-                {
-                    var n1 = block[i+1];
-                    var n2 = block[i+2];
-                    if ((n1.OpCode.Code == Code.Ceq || n1.OpCode.Code == Code.Cgt) &&
-                        (n2.OpCode.Code == Code.Brtrue || n2.OpCode.Code == Code.Brfalse))
-                    {
-                        // Это мусорная проверка, пропускаем всю тройку
-                        i += 2; 
-                        continue;
-                    }
-                    
-                    // Если константа идет перед stloc состояния - это значение перехода
-                    if (IsStloc(n1, out int sIdx) && sIdx == stateVarIndex)
-                    {
-                        nextState = GetConstantValue(ins);
-                        i += 1; // Пропускаем и константу, и stloc
-                        continue;
-                    }
-                }
-
-                // Пропускаем сами сравнения и ветвления (они уже обработаны внешней логикой)
-                if (ins.OpCode.Code == Code.Ceq || ins.OpCode.Code == Code.Cgt || ins.OpCode.Code == Code.Clt ||
-                    ins.OpCode.Code == Code.Brtrue || ins.OpCode.Code == Code.Brfalse ||
-                    ins.OpCode.Code == Code.Br || ins.OpCode.Code == Code.Br_S)
-                {
-                    continue;
-                }
-
-                // Пропускаем сток состояния (мы уже вытащили значение выше)
-                if (IsStloc(ins, out int stIdx) && stIdx == stateVarIndex)
-                {
-                    continue;
-                }
-
-                // Всё остальное - полезно
-                clean.Add(CloneInstruction(ins));
+                return usefulCode;
             }
 
-            return clean;
+            // Флаг: находимся ли мы внутри последовательности "ldc ... stloc state"?
+            // Если да, то ldc тоже нужно удалить, чтобы не оставить голое число на стеке.
+            bool pendingStateStore = false;
+
+            for (int i = startIndex; i < endIndex; i++)
+            {
+                var instr = allInstructions[i];
+
+                // 1. Пропускаем nop
+                if (instr.OpCode.Code == Code.Nop) continue;
+
+                // 2. Обработка присваиваний (stloc)
+                if (IsStloc(instr, out int stIdx))
+                {
+                    if (stIdx == stateVarIndex)
+                    {
+                        // Это обновление состояния цикла.
+                        // 1. Сохраняем значение nextState.
+                        // 2. НЕ добавляем инструкцию stloc в результат.
+                        // 3. Помечаем, что предыдущая инструкция (если это было ldc) тоже была мусором, 
+                        //    но так как мы идем вперед, мы просто не добавили её ранее (см. логику ниже).
+                        
+                        // Ищем значение в предыдущей инструкции, если это константа
+                        if (i > startIndex)
+                        {
+                            var prev = allInstructions[i - 1];
+                            var val = GetConstantValue(prev);
+                            if (val != null) nextState = val;
+                        }
+                        
+                        pendingStateStore = false; // Сброс флага, так как обработка завершена
+                        continue; // Пропускаем stloc
+                    }
+                    
+                    if (returnVarIndex.HasValue && stIdx == returnVarIndex.Value)
+                    {
+                        // Это присваивание возвращаемой переменной (например, text = call ...)
+                        // СОХРАНЯЕМ обязательно.
+                        usefulCode.Add(CloneInstruction(instr));
+                        continue;
+                    }
+
+                    // Присваивание в какую-то третью временную переменную?
+                    // Скорее всего мусор, если только это не часть сложного вычисления внутри блока.
+                    // Для безопасности пока пропускаем, если это не return и не state.
+                    continue;
+                }
+
+                // 3. Обработка загрузок констант (ldc)
+                if (instr.OpCode.Code == Code.Ldc_I4 || instr.OpCode.Code == Code.Ldc_I8 || 
+                    instr.OpCode.Code == Code.Ldc_R4 || instr.OpCode.Code == Code.Ldc_R8)
+                {
+                    // Смотрим вперед: если следующая значимая инструкция - это stloc stateVar,
+                    // значит эта константа нужна только для обновления счетчика цикла. Убираем её.
+                    bool isStateUpdateValue = false;
+                    for (int k = i + 1; k < endIndex; k++)
+                    {
+                        var nextIns = allInstructions[k];
+                        if (nextIns.OpCode.Code == Code.Nop) continue;
+                        
+                        if (IsStloc(nextIns, out int nextIdx) && nextIdx == stateVarIndex)
+                        {
+                            isStateUpdateValue = true;
+                            break;
+                        }
+                        // Если встретилось что-то другое (call, add, stloc other), значит константа нужна
+                        break;
+                    }
+
+                    if (isStateUpdateValue)
+                    {
+                        continue; // Пропускаем константу обновления состояния
+                    }
+                    
+                    // Если константа нужна для чего-то другого (аргумент метода и т.д.), оставляем
+                    usefulCode.Add(CloneInstruction(instr));
+                    continue;
+                }
+
+                // 4. Пропускаем загрузки переменной состояния (ldloc state)
+                if (GetLocalIndex(instr) == stateVarIndex)
+                {
+                    continue;
+                }
+
+                // 5. Пропускаем сравнения и ветвления (они уже обработаны структурой эмулятора)
+                if (instr.OpCode.Code == Code.Ceq || instr.OpCode.Code == Code.Cgt || instr.OpCode.Code == Code.Clt ||
+                    instr.OpCode.Code == Code.Brtrue || instr.OpCode.Code == Code.Brtrue_S ||
+                    instr.OpCode.Code == Code.Brfalse || instr.OpCode.Code == Code.Brfalse_S ||
+                    instr.OpCode.Code == Code.Br || instr.OpCode.Code == Code.Br_S)
+                {
+                    continue;
+                }
+
+                // 6. Всё остальное - полезный код (call, add, sub, ldloc других переменных)
+                usefulCode.Add(CloneInstruction(instr));
+            }
+
+            return usefulCode;
         }
 
-        private void ReplaceMethodBodyPreservingLocals(MethodDef method, List<Instruction> newInstrs)
+        private List<Instruction> ExtractBlockImproved(IList<Instruction> allInstructions, Instruction startInstr, int stateVarIndex, out object? nextState)
         {
-            // Не трогаем method.Body.Variables, оставляем как есть.
-            // Это критично, так как наши клонированные инструкции ссылаются на те же объекты Local.
-            
-            var body = method.Body;
-            body.Instructions.Clear();
-            foreach (var i in newInstrs) body.Instructions.Add(i);
-            
-            body.UpdateInstructionOffsets();
-            body.SimplifyMacros(method.Parameters);
+            var block = new List<Instruction>();
+            nextState = null;
+
+            int startIndex = allInstructions.IndexOf(startInstr);
+            if (startIndex == -1) return block;
+
+            int ip = startIndex;
+            int maxBlockLen = 200;
+
+            while (ip < allInstructions.Count)
+            {
+                var instr = allInstructions[ip];
+
+                if (ip + 1 < allInstructions.Count)
+                {
+                    var nextIns = allInstructions[ip + 1];
+                    if (IsStloc(nextIns, out int sIdx) && sIdx == stateVarIndex)
+                    {
+                        var val = GetConstantValue(instr);
+                        if (val != null) nextState = val;
+                        break;
+                    }
+                }
+
+                if (instr.OpCode.Code == Code.Ret || instr.OpCode.Code == Code.Throw)
+                {
+                    block.Add(CloneInstruction(instr));
+                    break;
+                }
+
+                bool shouldSkip = false;
+                if (GetLocalIndex(instr) == stateVarIndex &&
+                   (instr.OpCode.Code == Code.Ldloc || instr.OpCode.Code == Code.Ldloc_S ||
+                    (instr.OpCode.Code >= Code.Ldloc_0 && instr.OpCode.Code <= Code.Ldloc_3)))
+                {
+                    shouldSkip = true;
+                }
+
+                if (!shouldSkip)
+                {
+                    block.Add(CloneInstruction(instr));
+                }
+
+                ip++;
+                if (block.Count > maxBlockLen) break;
+            }
+
+            return block;
         }
 
-        private void RestoreMethod(MethodDef method, List<Instruction> backupInstructions, List<Local> backupLocals)
+        private void RestoreMethod(MethodDef method, List<Instruction> backupInstructions, List<Local> backupVariables)
         {
             var body = method.Body;
             body.Instructions.Clear();
+            body.Variables.Clear();
+            
+            foreach (var v in backupVariables) body.Variables.Add(v);
             foreach (var instr in backupInstructions)
             {
                 body.Instructions.Add(CloneInstruction(instr));
             }
-            // Восстанавливаем локальные, если они были изменены (на всякий случай)
-            body.Variables.Clear();
-            foreach (var loc in backupLocals)
-            {
-                body.Variables.Add(loc);
-            }
-            
             body.UpdateInstructionOffsets();
             body.SimplifyMacros(method.Parameters);
         }
@@ -508,9 +759,6 @@ namespace Deobfuscator
         {
             var op = orig.OpCode;
             var operand = orig.Operand;
-            // Важно: если операнд - Local, мы должны передать тот же самый объект Local из метода,
-            // а не создавать новый. dnlib обычно хранит ссылки на объекты Local в методе.
-            // Если мы клонируем инструкцию из того же метода (или backup), ссылка должна остаться той же.
             if (operand is Local l) return Instruction.Create(op, l);
             if (operand is Parameter p) return Instruction.Create(op, p);
             if (operand is Instruction t) return Instruction.Create(op, t);
@@ -525,6 +773,19 @@ namespace Deobfuscator
             if (operand is FieldDef fd) return Instruction.Create(op, fd);
             if (operand is MemberRef mr) return Instruction.Create(op, mr);
             return new Instruction(op, operand);
+        }
+
+        private void ReplaceMethodBody(MethodDef m, List<Instruction> newInstrs)
+        {
+            var body = m.Body;
+            // Важно: не очищаем Variables, если они нужны для новых инструкций, 
+            // но в нашем случае мы полагаемся на то, что индексы совпадают с оригиналом.
+            // Если бы мы меняли сигнатуру, нужно было бы мапить переменные.
+            
+            body.Instructions.Clear();
+            foreach (var i in newInstrs) body.Instructions.Add(i);
+            body.UpdateInstructionOffsets();
+            body.SimplifyMacros(m.Parameters);
         }
 
         #endregion
