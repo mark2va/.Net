@@ -11,10 +11,9 @@ namespace Deobfuscator
             if (args.Length < 1)
             {
                 Console.WriteLine("Usage: Deobfuscator.exe <input.exe> [--ai] [--server key] [--model key] [--debug]");
-                Console.WriteLine("  --ai       Enable AI renaming");
-                Console.WriteLine("  --server   Server key from ai_config.json (default: default)");
-                Console.WriteLine("  --model    Model key from ai_config.json (default: default)");
-                Console.WriteLine("  --debug    Enable detailed logging");
+                Console.WriteLine("Examples:");
+                Console.WriteLine("  Deobfuscator.exe sample.exe");
+                Console.WriteLine("  Deobfuscator.exe sample.exe --ai --server remote --model codellama --debug");
                 return;
             }
 
@@ -27,21 +26,8 @@ namespace Deobfuscator
 
             bool enableAi = args.Contains("--ai");
             bool debugMode = args.Contains("--debug");
-            
-            string serverKey = "default";
-            string modelKey = "default";
-
-            // Парсинг аргументов
-            if (args.Contains("--server"))
-            {
-                int idx = Array.IndexOf(args, "--server");
-                if (idx + 1 < args.Length) serverKey = args[idx + 1];
-            }
-            if (args.Contains("--model"))
-            {
-                int idx = Array.IndexOf(args, "--model");
-                if (idx + 1 < args.Length) modelKey = args[idx + 1];
-            }
+            string serverKey = GetArgValue(args, "--server", "default");
+            string modelKey = GetArgValue(args, "--model", "default");
 
             AiConfig config = new AiConfig();
             if (enableAi)
@@ -50,15 +36,12 @@ namespace Deobfuscator
                 config = AiConfig.Load(configPath, serverKey, modelKey);
                 config.Enabled = true;
                 
-                Console.WriteLine($"[*] AI Config Loaded:");
-                Console.WriteLine($"    Server: {serverKey} ({config.ApiUrl})");
-                Console.WriteLine($"    Model: {modelKey} ({config.ModelName})");
+                Console.WriteLine($"[*] AI Config: Server='{serverKey}', Model='{modelKey}'");
+                Console.WriteLine($"[*] Target URL: {config.ApiUrl}");
             }
 
-            string outputPath = Path.Combine(
-                Path.GetDirectoryName(inputPath) ?? Directory.GetCurrentDirectory(),
-                Path.GetFileNameWithoutExtension(inputPath) + "_deob.exe"
-            );
+            string dir = Path.GetDirectoryName(inputPath) ?? Directory.GetCurrentDirectory();
+            string outputPath = Path.Combine(dir, Path.GetFileNameWithoutExtension(inputPath) + "_deob.exe");
 
             try
             {
@@ -67,12 +50,20 @@ namespace Deobfuscator
                     deob.Deobfuscate();
                     deob.Save(outputPath);
                 }
+                Console.WriteLine($"[+] Output saved to: {outputPath}");
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[!] Fatal Error: {ex.Message}");
                 if (debugMode) Console.WriteLine(ex.StackTrace);
             }
+        }
+
+        static string GetArgValue(string[] args, string key, string defaultValue)
+        {
+            int idx = Array.IndexOf(args, key);
+            if (idx >= 0 && idx + 1 < args.Length) return args[idx + 1];
+            return defaultValue;
         }
     }
 }
