@@ -4,18 +4,26 @@ using System.Linq;
 using dnlib.DotNet;
 using dnlib.DotNet.Emit;
 using dnlib.DotNet.Writer;
+
 namespace Deobfuscator
 {
     public class UniversalDeobfuscator : IDisposable
     {
         private readonly ModuleDefMD _module;
-        public UniversalDeobfuscator(string filePath)
+        private readonly AiAssistant? _aiAssistant;
+
+        public UniversalDeobfuscator(string filePath, AiConfig aiConfig)
         {
             _module = ModuleDefMD.Load(filePath);
+            _aiAssistant = aiConfig.Enabled ? new AiAssistant(aiConfig) : null;
         }
         public void Deobfuscate()
         {
             Console.WriteLine("[*] Starting deep deobfuscation...");
+            if (_aiAssistant != null && _aiAssistant.Enabled)
+            {
+                Console.WriteLine("[AI] AI assistant enabled for method renaming.");
+            }
             int count = 0;
             foreach (var type in _module.GetTypes())
             {
@@ -26,9 +34,16 @@ namespace Deobfuscator
                     {
                         // Основной алгоритм распутывания через эмуляцию
                         EmulateAndUnravel(method);
-                        
+
                         // Очистка мусора (NOP)
                         CleanupMethod(method);
+
+                        // AI переименование если включено
+                        if (_aiAssistant != null && _aiAssistant.Enabled)
+                        {
+                            RenameMethodWithAi(method);
+                        }
+
                         count++;
                         Console.WriteLine($"[+] Unraveled: {method.FullName}");
                     }
@@ -340,6 +355,42 @@ namespace Deobfuscator
             body.UpdateInstructionOffsets();
             body.SimplifyMacros(method.Parameters);
         }
+        private void RenameMethodWithAi(MethodDef method)
+        {
+            if (_aiAssistant == null || !_aiAssistant.Enabled) return;
+            
+            try
+            {
+                // Получаем IL код метода
+                string ilCode = "";
+                if (method.Body != null && method.Body.HasInstructions)
+                {
+                    var sb = new System.Text.StringBuilder();
+                    foreach (var instr in method.Body.Instructions.Take(20)) // Ограничимся первыми 20 инструкциями
+                    {
+                        sb.AppendLine($"{instr.OpCode} {instr.Operand}");
+                    }
+                    ilCode = sb.ToString();
+                }
+                
+                string returnType = method.ReturnType?.ToString() ?? "void";
+                string currentName = method.Name;
+                
+                // Запрашиваем у AI новое имя
+                string? suggestedName = _aiAssistant.GetSuggestedName(currentName, ilCode, returnType);
+                
+                if (!string.IsNullOrEmpty(suggestedName) && suggestedName != currentName)
+                {
+                    method.Name = suggestedName;
+                    Console.WriteLine($"[AI] Renamed {currentName} -> {suggestedName}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[AI] Error renaming method {method.Name}: {ex.Message}");
+            }
+        }
+
         public void Save(string path)
         {
             Console.WriteLine($"[*] Saving to: {path}");
