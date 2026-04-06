@@ -6,122 +6,73 @@ namespace Deobfuscator
 {
     class Program
     {
-        static int Main(string[] args)
+        static void Main(string[] args)
         {
-            Console.WriteLine("=== Universal .NET Deobfuscator ===");
-            Console.WriteLine("Based on dnlib");
-            Console.WriteLine();
-
             if (args.Length < 1)
             {
-                PrintUsage();
-                return 1;
+                Console.WriteLine("Usage: Deobfuscator.exe <input.exe> [--ai] [--server key] [--model key] [--debug]");
+                Console.WriteLine("  --ai       Enable AI renaming");
+                Console.WriteLine("  --server   Server key from ai_config.json (default: default)");
+                Console.WriteLine("  --model    Model key from ai_config.json (default: default)");
+                Console.WriteLine("  --debug    Enable detailed logging");
+                return;
             }
 
-            string inputFile = args[0];
-            string outputFile;
+            string inputPath = args[0];
+            if (!File.Exists(inputPath))
+            {
+                Console.WriteLine($"[!] Error: File not found: {inputPath}");
+                return;
+            }
+
+            bool enableAi = args.Contains("--ai");
             bool debugMode = args.Contains("--debug");
+            
+            string serverKey = "default";
+            string modelKey = "default";
 
-            if (args.Length >= 2 && !args[1].StartsWith("--"))
+            // Парсинг аргументов
+            if (args.Contains("--server"))
             {
-                outputFile = args[1];
+                int idx = Array.IndexOf(args, "--server");
+                if (idx + 1 < args.Length) serverKey = args[idx + 1];
             }
-            else
+            if (args.Contains("--model"))
             {
-                string dir = Path.GetDirectoryName(inputFile) ?? "";
-                string name = Path.GetFileNameWithoutExtension(inputFile);
-                string ext = Path.GetExtension(inputFile);
-                outputFile = Path.Combine(dir, name + "_deob" + ext);
-                if (debugMode)
-                    Console.WriteLine($"[*] Output file not specified. Using: {outputFile}");
-            }
-
-            if (!File.Exists(inputFile))
-            {
-                Console.WriteLine($"[Error] File not found: {inputFile}");
-                return 1;
+                int idx = Array.IndexOf(args, "--model");
+                if (idx + 1 < args.Length) modelKey = args[idx + 1];
             }
 
-            var aiConfig = new AiConfig 
-            { 
-                Enabled = false,
-                ApiUrl = "http://localhost:11434",
-                Model = "codellama",
-                TimeoutSeconds = 120
-            };
-
-            for (int i = 1; i < args.Length; i++)
+            AiConfig config = new AiConfig();
+            if (enableAi)
             {
-                switch (args[i])
-                {
-                    case "--ai":
-                        aiConfig.Enabled = true;
-                        Console.WriteLine("[AI] AI assistant enabled.");
-                        break;
-                    case "--ai-url":
-                        if (i + 1 < args.Length)
-                        {
-                            aiConfig.ApiUrl = args[++i];
-                            Console.WriteLine($"[AI] Using API URL: {aiConfig.ApiUrl}");
-                        }
-                        break;
-                    case "--ai-model":
-                        if (i + 1 < args.Length)
-                        {
-                            aiConfig.Model = args[++i];
-                            Console.WriteLine($"[AI] Using model: {aiConfig.Model}");
-                        }
-                        break;
-                    case "--ai-timeout":
-                        if (i + 1 < args.Length && int.TryParse(args[++i], out int timeout))
-                        {
-                            aiConfig.TimeoutSeconds = timeout;
-                            Console.WriteLine($"[AI] Using timeout: {timeout}s");
-                        }
-                        break;
-                    case "--debug":
-                        break;
-                }
+                string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ai_config.json");
+                config = AiConfig.Load(configPath, serverKey, modelKey);
+                config.Enabled = true;
+                
+                Console.WriteLine($"[*] AI Config Loaded:");
+                Console.WriteLine($"    Server: {serverKey} ({config.ApiUrl})");
+                Console.WriteLine($"    Model: {modelKey} ({config.ModelName})");
             }
+
+            string outputPath = Path.Combine(
+                Path.GetDirectoryName(inputPath) ?? Directory.GetCurrentDirectory(),
+                Path.GetFileNameWithoutExtension(inputPath) + "_deob.exe"
+            );
 
             try
             {
-                using (var deobfuscator = new UniversalDeobfuscator(inputFile, aiConfig, debugMode))
+                using (var deob = new UniversalDeobfuscator(inputPath, config, debugMode))
                 {
-                    deobfuscator.Deobfuscate();
-                    deobfuscator.Save(outputFile);
+                    deob.Deobfuscate();
+                    deob.Save(outputPath);
                 }
-                
-                if (debugMode)
-                {
-                    string logPath = Path.Combine(Path.GetDirectoryName(inputFile) ?? "", "deob_log.txt");
-                    Console.WriteLine($"[+] Debug log saved to: {logPath}");
-                }
-                
-                Console.WriteLine($"[+] Successfully saved to: {outputFile}");
-                return 0;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Fatal Error]: {ex.Message}");
-                if (debugMode)
-                {
-                    Console.WriteLine(ex.StackTrace);
-                }
-                return 1;
+                Console.WriteLine($"[!] Fatal Error: {ex.Message}");
+                if (debugMode) Console.WriteLine(ex.StackTrace);
             }
-        }
-
-        static void PrintUsage()
-        {
-            Console.WriteLine("Usage: Deobfuscator.exe <input.exe> [output.exe] [options]");
-            Console.WriteLine();
-            Console.WriteLine("Options:");
-            Console.WriteLine("  --ai                 Enable AI renaming (requires local Ollama server)");
-            Console.WriteLine("  --ai-url <url>       AI Server URL (default: http://localhost:11434)");
-            Console.WriteLine("  --ai-model <name>    Model name (default: codellama)");
-            Console.WriteLine("  --ai-timeout <sec>   Request timeout in seconds (default: 120)");
-            Console.WriteLine("  --debug              Enable detailed logging to console and file");
         }
     }
 }
