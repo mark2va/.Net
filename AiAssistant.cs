@@ -9,107 +9,144 @@ namespace Deobfuscator
     {
         private readonly HttpClient _httpClient;
         private readonly AiConfig _config;
-        public bool IsConnected { get; private set; }
+        private bool _isConnected;
+        private bool _isModelAvailable;
 
         public AiAssistant(AiConfig config)
         {
             _config = config;
+            
             var handler = new HttpClientHandler
             {
                 ServerCertificateCustomValidationCallback = 
                     HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
             };
-            _httpClient = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(config.TimeoutSeconds) };
             
-            // Активная проверка подключения и модели
-            IsConnected = VerifyConnectionAndModel();
+            _httpClient = new HttpClient(handler)
+            {
+                Timeout = TimeSpan.FromSeconds(config.TimeoutSeconds)
+            };
+            
+            _isConnected = CheckConnectionAsync().Result;
+            if (_isConnected)
+            {
+                _isModelAvailable = CheckModelAsync().Result;
+            }
         }
 
-        private bool VerifyConnectionAndModel()
+        public bool IsConnected => _isConnected;
+        public bool IsModelAvailable() => _isModelAvailable;
+
+        private async System.Threading.Tasks.Task<bool> CheckConnectionAsync()
         {
             try
             {
-                Console.WriteLine($"[*] Testing connection to {_config.ApiUrl}...");
-                
-                // Для Ollama можно проверить наличие модели через GET /api/tags, но проще попробовать мини-запрос
-                // Или просто пингануть корень, если это стандартный сервис
                 var baseUrl = _config.ApiUrl;
-                if (baseUrl.EndsWith("/generate")) baseUrl = baseUrl.Substring(0, baseUrl.LastIndexOf('/'));
-                
-                var response = _httpClient.GetAsync(baseUrl).Result;
-                if (!response.IsSuccessStatusCode)
-                {
-                    Console.WriteLine($"[!] Server returned {(int)response.StatusCode}. Connection failed.");
-                    return false;
-                }
+                if (baseUrl.EndsWith("/generate")) 
+                    baseUrl = baseUrl.Replace("/api/generate", "");
+                else if (baseUrl.EndsWith("/completions"))
+                    baseUrl = baseUrl.Replace("/v1/completions", "");
 
-                // Пробный запрос к модели (очень короткий)
-                var payload = new { model = _config.ModelName, prompt = "hi", stream = false };
-                var json = JsonSerializer.Serialize(payload);
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-                
-                var testResp = _httpClient.PostAsync(_config.ApiUrl, content).Result;
-                if (testResp.IsSuccessStatusCode)
-                {
-                    Console.WriteLine($"[+] Successfully connected to model '{_config.ModelName}'.");
-                    return true;
-                }
-                else
-                {
-                    var err = testResp.Content.ReadAsStringAsync().Result;
-                    Console.WriteLine($"[!] Model '{_config.ModelName}' error: {err}");
-                    Console.WriteLine("[!] Ensure the model is pulled: ollama pull " + _config.ModelName);
-                    return false;
-                }
+                var response = await _httpClient.GetAsync(baseUrl);
+                return response.IsSuccessStatusCode;
             }
-            catch (Exception ex)
+            catch (Exception)
             {
-                Console.WriteLine($"[!] Connection test failed: {ex.Message}");
                 return false;
             }
         }
 
-        public string GetSuggestedName(string currentName, string codeSnippet, string returnType)
+        private async System.Threading.Tasks.Task<bool> CheckModelAsync()
         {
-            if (!IsConnected) return currentName;
+            try
+            {
+                // Для Ollama: GET /api/tags возвращает список моделей
+                var tagsUrl = _config.ApiUrl.Replace("/api/generate", "/api/tags");
+                if (_config.ApiType.ToLower() == "ollama")
+                {
+                    var response = await _httpClient.GetAsync(tagsUrl);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var json = await response.Content.ReadAsStringAsync();
+                        using var doc = JsonDocument.Parse(json);
+                        if (doc.RootElement.TryGetProperty("models", out var modelsElem))
+                        {
+                            foreach (var model in modelsElem.EnumerateArray())
+                            {
+                                if (model.TryGetProperty("name", out var nameElem))
+                                {
+                                    if (nameElem.GetString() == _config.ModelName)
+                                        return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // Для OpenAI совместимых можно попробовать запрос к /v1/models
+                    // Упрощенно считаем доступной, если сервер жив (для кастомных серверов сложно проверить без спецификации)
+                    return true; 
+                }
+                return false;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        public string GetSuggestedName(string currentName, string codeSnippet, string? returnType)
+        {
+            if (!_isConnected || !_isModelAvailable) return currentName;
 
             try
             {
-                var prompt = $@"Rename this C# method to a descriptive English name (PascalCase). Output ONLY the name.
-Type: {returnType}
+                var prompt = $@"Rename this C# member to a clear, descriptive English name (PascalCase). Output ONLY the name.
+Type: {returnType ?? "void"}
+Current: {currentName}
 Code:
 {codeSnippet}
 Name:";
 
-                var payload = new
+                if (_config.ApiType.ToLower() == "ollama")
                 {
-                    model = _config.ModelName,
-                    prompt = prompt,
-                    stream = false,
-                    options = new { temperature = 0.1, num_predict = 15 }
-                };
-
-                var json = JsonSerializer.Serialize(payload);
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-                var response = _httpClient.PostAsync(_config.ApiUrl, content).Result;
-
-                if (response.IsSuccessStatusCode)
-                {
-                    var respStr = response.Content.ReadAsStringAsync().Result;
-                    using var doc = JsonDocument.Parse(respStr);
-                    if (doc.RootElement.TryGetProperty("response", out var el))
+                    var payload = new
                     {
-                        var name = el.GetString()?.Trim().Replace("\"", "");
-                        if (!string.IsNullOrEmpty(name)) return name.Split(' ')[0];
+                        model = _config.ModelName,
+                        prompt = prompt,
+                        stream = false,
+                        options = new { temperature = 0.2, num_predict = 20 }
+                    };
+                    var json = JsonSerializer.Serialize(payload);
+                    var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                    var response = _httpClient.PostAsync(_config.ApiUrl, content).Result;
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var respStr = response.Content.ReadAsStringAsync().Result;
+                        using var doc = JsonDocument.Parse(respStr);
+                        if (doc.RootElement.TryGetProperty("response", out var el))
+                        {
+                            return CleanName(el.GetString());
+                        }
                     }
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[AI] Error: {ex.Message}");
-                IsConnected = false;
             }
+
             return currentName;
+        }
+
+        private string CleanName(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return "";
+            var clean = raw.Replace("\"", "").Replace("\n", "").Replace("\r", "").Trim();
+            var parts = clean.Split(' ');
+            return parts.Length > 0 ? parts[0] : clean;
         }
 
         public void Dispose() => _httpClient.Dispose();
