@@ -1,0 +1,22 @@
+{
+  "servers": {
+    "default": {
+      "url": "http://localhost:11434/api/generate",
+      "type": "ollama",
+      "timeout": 60,
+      "models": {
+        "default": { "name": "llama3" },
+        "codellama": { "name": "codellama" }
+      }
+    },
+    "remote": {
+      "url": "http://192.168.31.130:11434/api/generate",
+      "type": "ollama",
+      "timeout": 120,
+      "models": {
+        "codellama": { "name": "codellama" },
+        "deepseek": { "name": "deepseek-coder" }
+      }
+    }
+  }
+}
