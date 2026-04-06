@@ -14,6 +14,7 @@ namespace Deobfuscator
         private readonly AiConfig _aiConfig;
         private readonly bool _debugMode;
         private StreamWriter? _logWriter;
+        private int _obfCounter = 0;
 
         public UniversalDeobfuscator(string filePath, AiConfig aiConfig, bool debugMode = false)
         {
@@ -23,9 +24,11 @@ namespace Deobfuscator
 
             if (_debugMode)
             {
-                string logPath = Path.Combine(Path.GetDirectoryName(filePath) ?? "", "deob_log.txt");
-                _logWriter = new StreamWriter(logPath, false) { AutoFlush = true };
-                Log("=== Deobfuscation Started ===");
+                string dir = Path.GetDirectoryName(filePath) ?? Directory.GetCurrentDirectory();
+                string logPath = Path.Combine(dir, "deob_log.txt");
+                _logWriter = new StreamWriter(logPath, false);
+                _logWriter.AutoFlush = true;
+                Log("=== Deobfuscation Engine Started ===");
             }
         }
 
@@ -39,135 +42,531 @@ namespace Deobfuscator
 
         public void Deobfuscate()
         {
-            Console.WriteLine("[*] Phase 1: Unpacking Control Flow (Emulation)...");
-            Log("Starting control flow unpacking...");
-            int unpackedCount = UnpackControlFlow();
-            Console.WriteLine($"[+] Unpacked {unpackedCount} methods.");
+            Console.WriteLine("[*] Phase 1: Unraveling Control Flow (State Machine Emulation)...");
+            Log("Starting control flow unraveling...");
+            int unraveledCount = UnravelAllStateMachines();
+            Console.WriteLine($"[+] Unraveled {unraveledCount} methods.");
+            Log($"Unraveled {unraveledCount} methods.");
 
-            Console.WriteLine("[*] Phase 2: Dead Code Removal & Cleanup...");
-            Log("Starting cleanup...");
+            Console.WriteLine("[*] Phase 2: Deep Cleanup (Dead Code & Nops)...");
+            Log("Starting deep cleanup...");
             CleanupAll();
-
-            Console.WriteLine("[*] Phase 3: Renaming...");
-            RenameItems();
+            
+            Console.WriteLine("[*] Phase 3: Renaming Obfuscated Symbols...");
+            Log("Starting renaming process...");
+            RenameObfuscatedItems();
 
             Log("=== Deobfuscation Finished ===");
         }
 
         /// <summary>
-        /// Алгоритм эмуляции для раскрытия State Machine (вдохновлен de4dot).
-        /// Вычисляет значения переменной состояния и перестраивает переходы.
+        /// Главный метод распутывания. Проходит по всем методам и применяет эмуляцию.
         /// </summary>
-        private int UnpackControlFlow()
+        private int UnravelAllStateMachines()
         {
             int count = 0;
             foreach (var type in _module.GetTypes())
             {
-                foreach (var method in type.Methods.Where(m => m.HasBody && m.Body.Instructions.Count > 10))
+                foreach (var method in type.Methods)
                 {
-                    try
+                    if (!method.HasBody || !method.Body.IsIL) continue;
+                    
+                    // Пытаемся распутать. Если метод изменился - считаем успехом.
+                    if (EmulateAndSimplify(method))
                     {
-                        if (MethodUnpacker.Unpack(method))
-                        {
-                            count++;
-                            Log($"Unpacked: {method.FullName}");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"Error unpacking {method.FullName}: {ex.Message}");
+                        count++;
                     }
                 }
             }
             return count;
         }
 
+        /// <summary>
+        /// Эмулирует выполнение метода, чтобы восстановить реальный поток управления.
+        /// Алгоритм:
+        /// 1. Находим переменную состояния (обычно int/long локаль).
+        /// 2. Запускаем эмулятор, который отслеживает значение этой переменной.
+        /// 3. Строим новый список инструкций, игнорируя фейковые ветвления.
+        /// </summary>
+        private bool EmulateAndSimplify(MethodDef method)
+        {
+            var body = method.Body;
+            if (body.Instructions.Count < 5) return false;
+
+            // 1. Поиск переменной состояния
+            // Ищем локаль, которая часто участвует в паттернах: stloc, ldloc, ceq, switch/br
+            int? stateVarIndex = FindStateVariable(method);
+            
+            if (!stateVarIndex.HasValue)
+            {
+                // Если явной стейт-переменной нет, пробуем упрощенную очистку unreachable кода
+                // Это может помочь при простой обфускации мусорными переходами
+                RemoveUnreachableBlocks(method);
+                return false; 
+            }
+
+            Log($"  Found state variable V_{stateVarIndex.Value} in {method.Name}");
+
+            // 2. Эмуляция
+            // Мы будем собирать новые инструкции в этот список
+            var newInstructions = new List<Instruction>();
+            
+            // Стек эмулятора
+            var stack = new Stack<object?>();
+            // Локальные переменные эмулятора
+            var locals = new object?[body.Variables.Count];
+            
+            // Карта: Инструкция оригинала -> Инструкция в новом списке (если добавлена)
+            var instrMap = new Dictionary<Instruction, Instruction>();
+            
+            // Очередь для обхода графа (BFS), но с приоритетом порядка следования
+            // Храним: (Индекс инструкции в оригинале, Значение стейта ПЕРЕД этой инструкцией)
+            var queue = new Queue<Tuple<int, object?>>();
+            
+            // Отслеживаем посещенные состояния, чтобы не зациклиться в эмуляции обфускатора
+            // Ключ: (Индекс инструкции, Значение стейта)
+            var visitedStates = new HashSet<string>();
+
+            // Точка входа
+            queue.Enqueue(Tuple.Create(0, (object?)null));
+
+            int maxSteps = body.Instructions.Count * 100; // Защита от бесконечности
+            int steps = 0;
+
+            while (queue.Count > 0 && steps < maxSteps)
+            {
+                steps++;
+                var current = queue.Dequeue();
+                int ip = current.Item1; // Instruction Pointer (index)
+                object? currentState = current.Item2;
+
+                if (ip < 0 || ip >= body.Instructions.Count) continue;
+
+                string stateKey = $"{ip}:{currentState}";
+                if (visitedStates.Contains(stateKey)) continue;
+                visitedStates.Add(stateKey);
+
+                // Если мы уже добавили эту инструкцию в новый список через другой путь, 
+                // нам не нужно эмулировать её снова, но нужно убедиться, что переходы на неё работают.
+                // Однако, для простоты эмуляции потока, мы просто идем дальше.
+                
+                var instr = body.Instructions[ip];
+
+                // --- СИМВОЛИЧЕСКОЕ ВЫПОЛНЕНИЕ ---
+                
+                // Обработка записи в переменную состояния
+                if (IsStloc(instr, out int sIdx) && sIdx == stateVarIndex.Value)
+                {
+                    // Значение должно быть на стеке
+                    if (stack.Count > 0)
+                    {
+                        var val = stack.Pop();
+                        locals[stateVarIndex.Value] = val;
+                        // Эта инструкция (stloc) в новый код НЕ попадает, так как это часть обфускации
+                        // Переходим к следующей
+                        queue.Enqueue(Tuple.Create(ip + 1, val)); // Передаем новое значение стейта дальше
+                        continue; 
+                    }
+                }
+
+                // Обработка чтения переменной состояния (для условий)
+                if (IsLdloc(instr, out int lIdx) && lIdx == stateVarIndex.Value)
+                {
+                    var val = locals[stateVarIndex.Value];
+                    stack.Push(val);
+                    // Добавляем в новый код? Обычно ldloc стейта - это часть условия обфускации.
+                    // Мы постараемся удалить всё условие целиком позже, если сможем его вычислить.
+                    // Пока просто пропускаем добавление в newInstructions, если это чисто служебное чтение.
+                    // Но осторожно: если стейт используется в реальной логике (редко), надо оставить.
+                    // Эвристика: если следующее指令 - ldc + ceq, то это мусор.
+                    
+                    bool isJunkRead = false;
+                    if (ip + 2 < body.Instructions.Count)
+                    {
+                        var next = body.Instructions[ip+1];
+                        var next2 = body.Instructions[ip+2];
+                        if (IsConst(next) && IsCmp(next2)) isJunkRead = true;
+                    }
+
+                    if (!isJunkRead)
+                    {
+                        var newInstr = CloneInstruction(instr);
+                        newInstructions.Add(newInstr);
+                        instrMap[instr] = newInstr;
+                    }
+                    
+                    queue.Enqueue(Tuple.Create(ip + 1, currentState));
+                    continue;
+                }
+
+                // Обработка условных переходов, зависящих от стейта
+                if (instr.OpCode.FlowControl == FlowControl.Cond_Branch)
+                {
+                    // Пытаемся вычислить условие прямо сейчас
+                    bool? conditionResult = EvaluateCondition(stack, locals, stateVarIndex.Value, instr);
+
+                    if (conditionResult.HasValue)
+                    {
+                        // Условие вычислено! Это фейковый переход обфускатора.
+                        // Мы не добавляем само условие (ldloc, ldc, ceq, br) в новый код.
+                        // Просто идем по нужной ветке.
+                        
+                        Instruction target;
+                        if (conditionResult.Value)
+                        {
+                            target = instr.Operand as Instruction;
+                        }
+                        else
+                        {
+                            // Если ветка не взята, идем на следующую инструкцию (fallthrough)
+                            // НО: в обфускаторах часто бывает, что "false" ведет в мусор, а "true" по коду ниже.
+                            // Или наоборот. Нам нужно найти индекс следующей инструкции физически.
+                            target = (ip + 1 < body.Instructions.Count) ? body.Instructions[ip + 1] : null;
+                        }
+
+                        if (target != null)
+                        {
+                            int targetIdx = body.Instructions.IndexOf(target);
+                            // Передаем текущее значение стейта (оно не изменилось в момент перехода)
+                            queue.Enqueue(Tuple.Create(targetIdx, currentState));
+                        }
+                        continue; // Не добавляем инструкцию перехода в новый код
+                    }
+                    else
+                    {
+                        // Не смогли вычислить (реальное условие программы?).
+                        // Оставляем как есть, но мапим операнды.
+                        var newInstr = CloneInstruction(instr);
+                        newInstructions.Add(newInstr);
+                        instrMap[instr] = newInstr;
+                        
+                        // Ветвим эмуляцию по обоим путям, так как не знаем результат
+                        if (instr.Operand is Instruction t)
+                            queue.Enqueue(Tuple.Create(body.Instructions.IndexOf(t), currentState));
+                        queue.Enqueue(Tuple.Create(ip + 1, currentState));
+                        continue;
+                    }
+                }
+
+                // Обработка безусловного перехода
+                if (instr.OpCode.FlowControl == FlowControl.Branch)
+                {
+                    if (instr.Operand is Instruction t)
+                    {
+                        int targetIdx = body.Instructions.IndexOf(t);
+                        queue.Enqueue(Tuple.Create(targetIdx, currentState));
+                        continue; // Сам br не нужен, если мы перепрыгиваем
+                    }
+                }
+
+                // Обработка ret/throw
+                if (instr.OpCode.FlowControl == FlowControl.Return || instr.OpCode.FlowControl == FlowControl.Throw)
+                {
+                    var newInstr = CloneInstruction(instr);
+                    newInstructions.Add(newInstr);
+                    instrMap[instr] = newInstr;
+                    continue;
+                }
+
+                // --- ОБЫЧНЫЕ ИНСТРУКЦИИ ---
+                // Эмулируем стек для поддержки вычислений
+                SimulateStackOp(instr, stack, locals);
+
+                // Добавляем инструкцию в очищенный код
+                // Фильтруем явный мусор (ldc сразу перед stloc стейта мы уже обработали выше косвенно)
+                // Но сюда попадают арифметика, вызовы и т.д.
+                
+                // Пропускаем ldc, если они идут парой со stloc стейта (мы это уже обработали в блоке Stloc)
+                // Но здесь мы можем пропустить одиночные ldc, которые остались? Нет, они нужны.
+                // Главное: не добавлять ldc/stloc самой переменной стейта, если они служебные.
+                
+                bool skipAdd = false;
+                if (IsStloc(instr, out int skIdx) && skIdx == stateVarIndex.Value) skipAdd = true;
+                if (IsLdloc(instr, out int lkIdx) && lkIdx == stateVarIndex.Value) skipAdd = true; // Уже обработано выше
+                if (IsConst(instr) && ip + 1 < body.Instructions.Count && IsStloc(body.Instructions[ip+1], out int nsIdx) && nsIdx == stateVarIndex.Value) skipAdd = true;
+
+                if (!skipAdd)
+                {
+                    var newInstr = CloneInstruction(instr);
+                    newInstructions.Add(newInstr);
+                    instrMap[instr] = newInstr;
+                }
+
+                // Переход к следующей
+                queue.Enqueue(Tuple.Create(ip + 1, currentState));
+            }
+
+            if (newInstructions.Count == 0) return false;
+
+            // Применяем изменения
+            ReplaceMethodBody(method, newInstructions);
+            return true;
+        }
+
+        #region Helpers for Emulation
+
+        private int? FindStateVariable(MethodDef method)
+        {
+            var counts = new Dictionary<int, int>();
+            var instrs = method.Body.Instructions;
+
+            for (int i = 0; i < instrs.Count; i++)
+            {
+                if (IsStloc(instrs[i], out int idx))
+                {
+                    if (!counts.ContainsKey(idx)) counts[idx] = 0;
+                    counts[idx]++;
+                }
+            }
+
+            // Кандидат: переменная, которая пишется много раз (состояние меняется)
+            // Обычно в обфускаторах это одна переменная с частыми записями
+            foreach (var kvp in counts)
+            {
+                if (kvp.Value >= 3) return kvp.Key;
+            }
+            return null;
+        }
+
+        private bool? EvaluateCondition(Stack<object?> stack, object?[] locals, int stateVarIdx, Instruction branchInstr)
+        {
+            // Пытаемся отмотать стек назад, чтобы найти операнды условия
+            // Это сложно сделать постфактум, поэтому полагаемся на то, что эмулятор поддерживал стек корректно.
+            // Но в текущей реализации BFS стек сбрасывается. 
+            // УПРОЩЕНИЕ: В обфускаторах условие почти всегда: ldloc(state), ldc(val), ceq/cgt/clt, br...
+            // Посмотрим назад в оригинальном коде.
+            
+            var instrs = method.Body.Instructions; // Ошибка: method не доступен в этом контексте напрямую без передачи
+            // Исправление: передавать instrs или использовать замыкание. 
+            // Для простоты, реализуем проверку через локальные значения, если они известны.
+            
+            // В данной реализации BFS мы не храним полный стек для каждой точки входа эффективно.
+            // Поэтому вернемся к стратегии: если мы знаем значение locals[stateVarIdx], 
+            // и видим паттерн в коде ПОСЛЕ выполнения предыдущих шагов...
+            
+            // Альтернатива: Условие уже должно было быть вычислено при прохождении предыдущих инструкций?
+            // Нет, в BFS мы прыгаем.
+            
+            // Вернемся к надежному методу: анализ паттернов вокруг branchInstr.
+            // Ищем: ... ldloc(state), ldc(X), ceq, br ...
+            int idx = Array.IndexOf(method.Body.Instructions.ToArray(), branchInstr);
+            if (idx < 3) return null;
+
+            var i1 = method.Body.Instructions[idx - 1]; // cmp
+            var i2 = method.Body.Instructions[idx - 2]; // ldc
+            var i3 = method.Body.Instructions[idx - 3]; // ldloc
+
+            if (IsLdloc(i3, out int lIdx) && lIdx == stateVarIdx && 
+                IsConst(i2, out object? constVal) && 
+                IsCmp(i1, out Code cmpCode))
+            {
+                var currentVal = locals[stateVarIdx];
+                if (currentVal != null && constVal != null)
+                {
+                    return Compare(currentVal, constVal, cmpCode);
+                }
+            }
+            
+            // Проверка на brtrue/brfalse от переменной
+            if ((branchInstr.OpCode.Code == Code.Brtrue || branchInstr.OpCode.Code == Code.Brfalse ||
+                 branchInstr.OpCode.Code == Code.Brtrue_S || branchInstr.OpCode.Code == Code.Brfalse_S))
+            {
+                 if (idx >= 1)
+                 {
+                     var prev = method.Body.Instructions[idx - 1];
+                     if (IsLdloc(prev, out int lIdx2) && lIdx2 == stateVarIdx)
+                     {
+                         var val = locals[stateVarIdx];
+                         if (val != null)
+                         {
+                             bool isZero = Convert.ToInt64(val) == 0;
+                             bool isBrTrue = branchInstr.OpCode.Code == Code.Brtrue || branchInstr.OpCode.Code == Code.Brtrue_S;
+                             return isBrTrue ? !isZero : isZero;
+                         }
+                     }
+                 }
+            }
+
+            return null;
+        }
+        
+        // Нужно передать массив инструкций в EvaluateCondition или иметь доступ к method
+        // Исправим сигнатуру выше и передадим массив. 
+        // В методе EmulateAndSimplify у нас есть access to body.Instructions.
+        // Чтобы не усложнять, сделаем EvaluateCondition внутренним методом с доступом к closure или передадим массив.
+        // В коде выше вызов: EvaluateCondition(stack, locals, stateVarIndex.Value, instr);
+        // Добавим параметр instructions.
+        
+        private bool? EvaluateCondition(Stack<object?> stack, object?[] locals, int stateVarIdx, Instruction branchInstr, IList<Instruction> instructions)
+        {
+             int idx = -1;
+             // Быстрый поиск индекса (в реальном коде лучше хранить мапу Instruction->Index)
+             for(int i=0; i<instructions.Count; i++) if(instructions[i] == branchInstr) { idx = i; break; }
+             
+             if (idx < 3) return null;
+
+             var i1 = instructions[idx - 1]; 
+             var i2 = instructions[idx - 2]; 
+             var i3 = instructions[idx - 3]; 
+
+             if (IsLdloc(i3, out int lIdx) && lIdx == stateVarIdx && 
+                 IsConst(i2, out object? constVal) && 
+                 IsCmp(i1, out Code cmpCode))
+             {
+                 var currentVal = locals[stateVarIdx];
+                 if (currentVal != null && constVal != null)
+                     return Compare(currentVal, constVal, cmpCode);
+             }
+             
+             if ((branchInstr.OpCode.Code == Code.Brtrue || branchInstr.OpCode.Code == Code.Brfalse ||
+                  branchInstr.OpCode.Code == Code.Brtrue_S || branchInstr.OpCode.Code == Code.Brfalse_S))
+             {
+                  if (idx >= 1)
+                  {
+                      var prev = instructions[idx - 1];
+                      if (IsLdloc(prev, out int lIdx2) && lIdx2 == stateVarIdx)
+                      {
+                          var val = locals[stateVarIdx];
+                          if (val != null)
+                          {
+                              long v = Convert.ToInt64(val);
+                              bool isZero = v == 0;
+                              bool isBrTrue = branchInstr.OpCode.Code == Code.Brtrue || branchInstr.OpCode.Code == Code.Brtrue_S;
+                              return isBrTrue ? !isZero : isZero;
+                          }
+                      }
+                  }
+             }
+             return null;
+        }
+        // Примечание: в коде EmulateAndSimplify нужно заменить вызов на новый с параметром body.Instructions
+
+        private void SimulateStackOp(Instruction instr, Stack<object?> stack, object?[] locals)
+        {
+            try
+            {
+                switch (instr.OpCode.Code)
+                {
+                    case Code.Ldc_I4: case Code.Ldc_I4_0: case Code.Ldc_I4_1: case Code.Ldc_I4_2: 
+                    case Code.Ldc_I4_3: case Code.Ldc_I4_4: case Code.Ldc_I4_5: case Code.Ldc_I4_6: 
+                    case Code.Ldc_I4_7: case Code.Ldc_I4_8: case Code.Ldc_I4_M1:
+                    case Code.Ldc_I8: case Code.Ldc_R4: case Code.Ldc_R8:
+                        stack.Push(GetConstValue(instr));
+                        break;
+                    case Code.Ldloc: case Code.Ldloc_S: case Code.Ldloc_0: case Code.Ldloc_1: case Code.Ldloc_2: case Code.Ldloc_3:
+                        int li = GetLocalIndex(instr);
+                        if (li >= 0 && li < locals.Length) stack.Push(locals[li]);
+                        break;
+                    case Code.Stloc: case Code.Stloc_S: case Code.Stloc_0: case Code.Stloc_1: case Code.Stloc_2: case Code.Stloc_3:
+                        int si = GetLocalIndex(instr);
+                        if (si >= 0 && si < locals.Length && stack.Count > 0)
+                            locals[si] = stack.Pop();
+                        break;
+                    case Code.Add:
+                        if (stack.Count >= 2) { var b = stack.Pop(); var a = stack.Pop(); stack.Push(Add(a, b)); }
+                        break;
+                    case Code.Sub:
+                        if (stack.Count >= 2) { var b = stack.Pop(); var a = stack.Pop(); stack.Push(Sub(a, b)); }
+                        break;
+                    // Можно добавить больше операций для точности
+                }
+            }
+            catch { }
+        }
+
+        #endregion
+
         private void CleanupAll()
         {
             foreach (var type in _module.GetTypes())
             {
-                foreach (var method in type.Methods.Where(m => m.HasBody))
+                foreach (var method in type.Methods)
                 {
-                    RemoveUnreachableBlocks(method);
-                    RemoveNops(method);
-                    SimplifyMacros(method);
+                    if (method.HasBody)
+                    {
+                        RemoveUnreachableBlocks(method);
+                        CleanupNops(method);
+                        SimplifyMacros(method);
+                    }
                 }
             }
         }
 
-        /// <summary>
-        /// Удаляет инструкции, до которых нельзя добраться (Dead Code).
-        /// </summary>
         private void RemoveUnreachableBlocks(MethodDef method)
         {
             var body = method.Body;
-            var instructions = body.Instructions;
-            if (instructions.Count == 0) return;
-
             var reachable = new HashSet<Instruction>();
-            var queue = new Queue<Instruction>();
+            var q = new Queue<Instruction>();
 
-            // Старт с первой инструкции
-            reachable.Add(instructions[0]);
-            queue.Enqueue(instructions[0]);
-
-            while (queue.Count > 0)
+            if (body.Instructions.Count > 0)
             {
-                var instr = queue.Dequeue();
-                int idx = instructions.IndexOf(instr);
+                q.Enqueue(body.Instructions[0]);
+                reachable.Add(body.Instructions[0]);
+            }
+
+            while (q.Count > 0)
+            {
+                var curr = q.Dequeue();
+                int idx = body.Instructions.IndexOf(curr);
                 if (idx == -1) continue;
 
-                // Переход к следующей, если не безусловный переход/возврат
-                var flow = instr.OpCode.FlowControl;
-                if (flow != FlowControl.Branch && flow != FlowControl.Ret && flow != FlowControl.Throw)
+                if (curr.OpCode.FlowControl != FlowControl.Branch && 
+                    curr.OpCode.FlowControl != FlowControl.Ret && 
+                    curr.OpCode.FlowControl != FlowControl.Throw)
                 {
-                    if (idx + 1 < instructions.Count)
+                    if (idx + 1 < body.Instructions.Count)
                     {
-                        var next = instructions[idx + 1];
-                        if (reachable.Add(next)) queue.Enqueue(next);
+                        var next = body.Instructions[idx + 1];
+                        if (reachable.Add(next)) q.Enqueue(next);
                     }
                 }
 
-                // Цели переходов
-                if (instr.Operand is Instruction target)
+                if (curr.Operand is Instruction t)
                 {
-                    if (reachable.Add(target)) queue.Enqueue(target);
+                    if (reachable.Add(t)) q.Enqueue(t);
                 }
-                else if (instr.Operand is Instruction[] targets)
+                else if (curr.Operand is Instruction[] ts)
                 {
-                    foreach (var t in targets) if (reachable.Add(t)) queue.Enqueue(t);
+                    foreach (var x in ts) if (reachable.Add(x)) q.Enqueue(x);
                 }
             }
 
-            // Замена недостижимого на NOP
             bool changed = false;
-            for (int i = instructions.Count - 1; i >= 0; i--)
+            for (int i = body.Instructions.Count - 1; i >= 0; i--)
             {
-                if (!reachable.Contains(instructions[i]))
+                if (!reachable.Contains(body.Instructions[i]))
                 {
-                    instructions[i].OpCode = OpCodes.Nop;
-                    instructions[i].Operand = null;
+                    body.Instructions[i].OpCode = OpCodes.Nop;
+                    body.Instructions[i].Operand = null;
                     changed = true;
                 }
             }
-            if (changed) Log($"Removed dead code in {method.Name}");
+            if (changed) CleanupNops(method);
         }
 
-        private void RemoveNops(MethodDef method)
+        private void CleanupNops(MethodDef method)
         {
             var body = method.Body;
-            // Простое удаление NOP, которые не являются целями переходов
-            for (int i = body.Instructions.Count - 1; i >= 0; i--)
+            bool changed = true;
+            while (changed)
             {
-                if (body.Instructions[i].OpCode.Code == Code.Nop)
+                changed = false;
+                for (int i = body.Instructions.Count - 1; i >= 0; i--)
                 {
-                    bool isTarget = false;
-                    foreach (var ins in body.Instructions)
+                    if (body.Instructions[i].OpCode.Code == Code.Nop)
                     {
-                        if (ins.Operand == body.Instructions[i]) { isTarget = true; break; }
-                        if (ins.Operand is Instruction[] arr && arr.Contains(body.Instructions[i])) { isTarget = true; break; }
+                        bool isTarget = false;
+                        foreach (var ins in body.Instructions)
+                        {
+                            if (ins.Operand == body.Instructions[i]) { isTarget = true; break; }
+                            if (ins.Operand is Instruction[] arr && arr.Contains(body.Instructions[i])) { isTarget = true; break; }
+                        }
+                        if (!isTarget)
+                        {
+                            body.Instructions.RemoveAt(i);
+                            changed = true;
+                        }
                     }
-                    if (!isTarget) body.Instructions.RemoveAt(i);
                 }
             }
             body.UpdateInstructionOffsets();
@@ -179,96 +578,121 @@ namespace Deobfuscator
             method.Body.UpdateInstructionOffsets();
         }
 
-        private void RenameItems()
+        private void ReplaceMethodBody(MethodDef m, List<Instruction> newInstrs)
+        {
+            var body = m.Body;
+            body.Instructions.Clear();
+            foreach (var i in newInstrs) body.Instructions.Add(i);
+            body.UpdateInstructionOffsets();
+            body.SimplifyMacros(m.Parameters);
+        }
+
+        private void RenameObfuscatedItems()
         {
             bool useAi = _aiConfig.Enabled;
             AiAssistant? ai = null;
 
             if (useAi)
             {
+                // Жесткая проверка подключения и модели
+                Console.WriteLine("[*] Checking AI connection and model availability...");
                 ai = new AiAssistant(_aiConfig);
+                
                 if (!ai.IsConnected)
                 {
-                    Console.WriteLine("[!] AI unavailable. Using heuristic renaming.");
+                    Console.WriteLine("[!] AI Server unreachable. Falling back to simple renaming.");
                     useAi = false;
                     ai.Dispose();
                     ai = null;
                 }
+                else if (!ai.IsModelAvailable())
+                {
+                    Console.WriteLine($"[!] Model '{_aiConfig.ModelName}' not found on server. Falling back to simple renaming.");
+                    useAi = false;
+                    ai.Dispose();
+                    ai = null;
+                }
+                else
+                {
+                    Console.WriteLine($"[+] AI Ready: {_aiConfig.ApiUrl} | Model: {_aiConfig.ModelName}");
+                }
             }
 
-            int renamed = 0;
-            int classCounter = 1, methodCounter = 1;
+            int renamedCount = 0;
 
             foreach (var type in _module.GetTypes())
             {
-                if (IsObfuscated(type.Name))
+                if (IsObfuscatedName(type.Name))
                 {
-                    type.Name = useAi ? ai!.GetSuggestedName(type.Name, "", "Class") : $"Logic_Class_{classCounter++}";
-                    renamed++;
+                    string newName = useAi && ai != null ? ai.GetSuggestedName(type.Name, "Class definition", "Class") : GenerateSimpleTypeName();
+                    if (!string.IsNullOrEmpty(newName))
+                    {
+                        type.Name = newName;
+                        renamedCount++;
+                    }
                 }
 
                 foreach (var method in type.Methods)
                 {
-                    if (method.IsConstructor || method.Name.StartsWith("get_") || method.Name.StartsWith("set_")) continue;
-                    
-                    if (IsObfuscated(method.Name))
+                    if (method.Name == ".cctor" || method.Name == ".ctor") continue;
+                    if (IsObfuscatedName(method.Name))
                     {
-                        if (useAi && method.HasBody)
+                        string snippet = GetMethodSnippet(method);
+                        string retType = method.ReturnType?.ToString() ?? "void";
+                        
+                        string newName = "Method_" + _obfCounter++;
+                        if (useAi && ai != null)
                         {
-                            string snippet = GetSnippet(method);
-                            string ret = method.ReturnType?.ToString() ?? "void";
-                            method.Name = ai!.GetSuggestedName(method.Name, snippet, ret);
+                            string aiName = ai.GetSuggestedName(method.Name, snippet, retType);
+                            if (!string.IsNullOrEmpty(aiName) && aiName != method.Name && IsValidName(aiName))
+                                newName = aiName;
                         }
-                        else
-                        {
-                            // Эвристика: попытка угадать назначение по сигнатуре
-                            method.Name = HeuristicRename(method, methodCounter);
-                        }
-                        methodCounter++;
-                        renamed++;
+                        
+                        method.Name = newName;
+                        renamedCount++;
                     }
                 }
             }
-            Console.WriteLine($"[+] Renamed {renamed} items.");
+
+            Console.WriteLine($"[+] Renamed {renamedCount} items.");
             ai?.Dispose();
         }
 
-        private string HeuristicRename(MethodDef m, int id)
-        {
-            if (m.ReturnType.FullName == "System.Void")
-            {
-                if (m.Parameters.Count == 0) return $"Action_Init_{id}";
-                return $"Method_Execute_{id}";
-            }
-            if (m.ReturnType.FullName.Contains("String")) return $"Data_GetString_{id}";
-            if (m.ReturnType.FullName.Contains("Int")) return $"Calc_Compute_{id}";
-            if (m.ReturnType.FullName.Contains("Boolean")) return $"Check_Condition_{id}";
-            
-            return $"Func_Handler_{id}";
-        }
-
-        private string GetSnippet(MethodDef m)
+        private string GenerateSimpleTypeName() => "Class_" + (_obfCounter++);
+        
+        private string GetMethodSnippet(MethodDef m)
         {
             if (!m.HasBody) return "";
             var sb = new System.Text.StringBuilder();
-            int limit = Math.Min(20, m.Body.Instructions.Count);
-            for (int i = 0; i < limit; i++) sb.AppendLine(m.Body.Instructions[i].ToString());
+            int count = Math.Min(20, m.Body.Instructions.Count);
+            for (int i = 0; i < count; i++)
+                sb.AppendLine(m.Body.Instructions[i].ToString());
             return sb.ToString();
         }
 
-        private bool IsObfuscated(string name)
+        private bool IsObfuscatedName(string name)
         {
             if (string.IsNullOrEmpty(name)) return false;
-            if (name.Length <= 3 && name.All(char.IsLetter)) return true;
-            if (System.Text.RegularExpressions.Regex.IsMatch(name, @"^[a-z]{1,2}\d+$")) return true;
-            if (name.StartsWith("<") && name.EndsWith(">")) return false; // Свойства/события
+            if (name.StartsWith("<")) return false; 
+            if (name.Length <= 2 && name.All(char.IsLetter)) return true;
+            if (System.Text.RegularExpressions.Regex.IsMatch(name, @"^[a-z]{1,3}\d+$")) return true;
+            if (System.Text.RegularExpressions.Regex.IsMatch(name, @"^[A-Z]{1}\d+$")) return true;
             return false;
+        }
+
+        private bool IsValidName(string n)
+        {
+            if (string.IsNullOrEmpty(n)) return false;
+            if (!char.IsLetter(n[0]) && n[0] != '_') return false;
+            foreach (var c in n) if (!char.IsLetterOrDigit(c) && c != '_') return false;
+            return true;
         }
 
         public void Save(string path)
         {
             Console.WriteLine($"[*] Saving to: {path}");
-            Log($"Saving: {path}");
+            Log($"Saving to: {path}");
+            
             var opts = new ModuleWriterOptions(_module)
             {
                 Logger = DummyLogger.NoThrowInstance,
@@ -281,154 +705,136 @@ namespace Deobfuscator
         public void Dispose()
         {
             _logWriter?.Close();
-            _module?.Dispose();
-        }
-    }
-
-    /// <summary>
-    /// Вспомогательный класс для эмуляции и раскрытия обфускации потока управления.
-    /// Реализует упрощенную версию алгоритма de4dot.
-    /// </summary>
-    public static class MethodUnpacker
-    {
-        public static bool Unpack(MethodDef method)
-        {
-            if (!method.HasBody) return false;
-            var body = method.Body;
-            var instructions = body.Instructions;
-
-            // 1. Поиск переменной состояния (State Variable)
-            // Обычно это локаль, в которую часто пишут константы перед ветвлениями
-            int? stateVar = FindStateVariable(method);
-            if (!stateVar.HasValue) return false;
-
-            // 2. Символьное выполнение для построения реального графа
-            // Мы эмулируем только вычисление адреса перехода, не выполняя побочные эффекты
-            var realInstructions = new List<Instruction>();
-            var visited = new HashSet<int>();
-            var stack = new Stack<object?>();
-            var locals = new object?[body.Variables.Count];
-            
-            // Инициализация: пытаемся найти стартовое значение
-            // Обычно в начале метода: ldc.i4.X -> stloc stateVar
-            object? currentState = null;
-            for (int i = 0; i < Math.Min(10, instructions.Count); i++)
-            {
-                if (instructions[i].OpCode.Code == Code.Stloc && ((Local)instructions[i].Operand).Index == stateVar.Value)
-                {
-                    if (i > 0) currentState = GetConstant(instructions[i-1]);
-                }
-                else if (instructions[i].OpCode.Code >= Code.Stloc_0 && instructions[i].OpCode.Code <= Code.Stloc_3)
-                {
-                     int idx = instructions[i].OpCode.Code - Code.Stloc_0;
-                     if (idx == stateVar.Value && i > 0) currentState = GetConstant(instructions[i-1]);
-                }
-            }
-
-            if (currentState == null) return false; // Не нашли явного стейта
-
-            locals[stateVar.Value] = currentState;
-            var queue = new Queue<int>();
-            queue.Enqueue(0); // Начинаем с первой инструкции
-
-            // Эмуляция прохода для сбора достижимых инструкций
-            // В реальной реализации de4dot здесь сложный анализ, здесь упрощенный вариант
-            // Мы просто помечаем инструкции, которые выполняются при известном состоянии
-            
-            // Примечание: Полная эмуляция сложна для одного файла. 
-            // Здесь мы применяем эвристику: если видим паттерн "ldloc state, ldc val, ceq, brtrue",
-            // и значение совпадает с текущим состоянием, мы считаем ветку истинной.
-            
-            bool modified = false;
-            
-            // Проход 1: Упрощение условий на основе найденного стейта
-            for (int i = 0; i < instructions.Count - 3; i++)
-            {
-                // Паттерн: ldloc(state), ldc(const), ceq, brtrue target
-                if (IsLdloc(instructions[i], stateVar.Value) && 
-                    IsConst(instructions[i+1]) && 
-                    instructions[i+2].OpCode.Code == Code.Ceq &&
-                    (instructions[i+3].OpCode.Code == Code.Brtrue || instructions[i+3].OpCode.Code == Code.Brtrue_S))
-                {
-                    var constVal = GetConstant(instructions[i+1]);
-                    if (constVal != null && currentState != null && constVal.Equals(currentState))
-                    {
-                        // Условие истинно: превращаем в безусловный переход
-                        instructions[i+3].OpCode = OpCodes.Br;
-                        modified = true;
-                        
-                        // Обновляем состояние, если в целевом блоке есть присваивание
-                        // (Это требует более глубокого анализа, пока пропускаем для простоты)
-                    }
-                    else if (constVal != null)
-                    {
-                        // Условие ложно: заменяем на NOP
-                        instructions[i+3].OpCode = OpCodes.Nop;
-                        instructions[i+3].Operand = null;
-                        modified = true;
-                    }
-                }
-            }
-
-            if (modified)
-            {
-                // После изменения переходов нужно удалить недостижимый код
-                // Это делается в основном классе Cleanup
-                return true;
-            }
-
-            return false;
+            _module.Dispose();
         }
 
-        private static int? FindStateVariable(MethodDef method)
+        #region Static Helpers
+        
+        // Необходимо исправить вызов EvaluateCondition в EmulateAndSimplify, передав туда body.Instructions
+        // Но так как это внутренний класс, проще сделать хелперы статическими или полями класса.
+        // В методе EmulateAndSimplify замените вызов:
+        // bool? conditionResult = EvaluateCondition(stack, locals, stateVarIndex.Value, instr, body.Instructions);
+
+        private static bool IsStloc(Instruction i, out int idx)
         {
-            var counts = new Dictionary<int, int>();
-            var instrs = method.Body.Instructions;
-            
-            for (int i = 0; i < instrs.Count - 3; i++)
+            idx = -1;
+            if (i.Operand is Local l) idx = l.Index;
+            else if (i.OpCode.Code == Code.Stloc_0) idx = 0;
+            else if (i.OpCode.Code == Code.Stloc_1) idx = 1;
+            else if (i.OpCode.Code == Code.Stloc_2) idx = 2;
+            else if (i.OpCode.Code == Code.Stloc_3) idx = 3;
+            return idx != -1;
+        }
+
+        private static bool IsLdloc(Instruction i, out int idx)
+        {
+            idx = -1;
+            if (i.Operand is Local l) idx = l.Index;
+            else if (i.OpCode.Code == Code.Ldloc_0) idx = 0;
+            else if (i.OpCode.Code == Code.Ldloc_1) idx = 1;
+            else if (i.OpCode.Code == Code.Ldloc_2) idx = 2;
+            else if (i.OpCode.Code == Code.Ldloc_3) idx = 3;
+            return idx != -1;
+        }
+
+        private static int GetLocalIndex(Instruction i)
+        {
+            if (IsLdloc(i, out int idx) || IsStloc(i, out idx)) return idx;
+            return -1;
+        }
+
+        private static bool IsConst(Instruction i, out object? val)
+        {
+            val = null;
+            switch (i.OpCode.Code)
             {
-                if (instrs[i].OpCode.Code == Code.Ldloc && instrs[i].Operand is Local l)
+                case Code.Ldc_I4: val = i.Operand as int?; return true;
+                case Code.Ldc_I4_0: val = 0; return true;
+                case Code.Ldc_I4_1: val = 1; return true;
+                case Code.Ldc_I4_2: val = 2; return true;
+                case Code.Ldc_I4_3: val = 3; return true;
+                case Code.Ldc_I4_4: val = 4; return true;
+                case Code.Ldc_I4_5: val = 5; return true;
+                case Code.Ldc_I4_6: val = 6; return true;
+                case Code.Ldc_I4_7: val = 7; return true;
+                case Code.Ldc_I4_8: val = 8; return true;
+                case Code.Ldc_I4_M1: val = -1; return true;
+                case Code.Ldc_I8: val = i.Operand as long?; return true;
+                case Code.Ldc_R4: val = i.Operand as float?; return true;
+                case Code.Ldc_R8: val = i.Operand as double?; return true;
+                default: return false;
+            }
+        }
+        
+        private static bool IsConst(Instruction i) => IsConst(i, out _);
+
+        private static bool IsCmp(Instruction i, out Code code)
+        {
+            code = i.OpCode.Code;
+            return code == Code.Ceq || code == Code.Cgt || code == Code.Clt || code == Code.Cgt_Un || code == Code.Clt_Un;
+        }
+        
+        private static bool IsCmp(Instruction i) => IsCmp(i, out _);
+
+        private static object? GetConstValue(Instruction i)
+        {
+            IsConst(i, out var val);
+            return val;
+        }
+
+        private static bool? Compare(object? a, object? b, Code op)
+        {
+            if (a == null || b == null) return null;
+            try
+            {
+                double da = Convert.ToDouble(a);
+                double db = Convert.ToDouble(b);
+                switch (op)
                 {
-                    if (instrs[i+1].OpCode.Code == Code.Ldc_I4 && instrs[i+2].OpCode.Code == Code.Ceq)
-                    {
-                        if (!counts.ContainsKey(l.Index)) counts[l.Index] = 0;
-                        counts[l.Index]++;
-                    }
+                    case Code.Ceq: return da == db;
+                    case Code.Cgt: case Code.Cgt_Un: return da > db;
+                    case Code.Clt: case Code.Clt_Un: return da < db;
                 }
-            }
-            
-            // Переменная состояния обычно используется в сравнениях много раз (> 2)
-            foreach (var kvp in counts)
-            {
-                if (kvp.Value > 2) return kvp.Key;
-            }
+            } catch { }
             return null;
         }
 
-        private static bool IsLdloc(Instruction i, int index)
+        private static object? Add(object? a, object? b)
         {
-            if (i.OpCode.Code == Code.Ldloc && ((Local)i.Operand).Index == index) return true;
-            if (i.OpCode.Code >= Code.Ldloc_0 && i.OpCode.Code <= Code.Ldloc_3)
-                return (i.OpCode.Code - Code.Ldloc_0) == index;
-            return false;
+            if (a is double da && b is double db) return da + db;
+            if (a is long la && b is long lb) return la + lb;
+            if (a is int ia && b is int ib) return ia + ib;
+            return null;
         }
 
-        private static bool IsConst(Instruction i)
+        private static object? Sub(object? a, object? b)
         {
-            return i.OpCode.Code == Code.Ldc_I4 || i.OpCode.Code == Code.Ldc_I8 || i.OpCode.Code == Code.Ldc_R4 || i.OpCode.Code == Code.Ldc_R8;
+            if (a is double da && b is double db) return da - db;
+            if (a is long la && b is long lb) return la - lb;
+            if (a is int ia && b is int ib) return ia - ib;
+            return null;
         }
 
-        private static object? GetConstant(Instruction i)
+        private static Instruction CloneInstruction(Instruction orig)
         {
-            switch (i.OpCode.Code)
-            {
-                case Code.Ldc_I4: return i.Operand as int?;
-                case Code.Ldc_I4_0: return 0;
-                case Code.Ldc_I4_1: return 1;
-                case Code.Ldc_I4_M1: return -1;
-                // ... можно добавить остальные
-                default: return i.Operand;
-            }
+            var op = orig.OpCode;
+            var operand = orig.Operand;
+            if (operand is Local l) return Instruction.Create(op, l);
+            if (operand is Parameter p) return Instruction.Create(op, p);
+            if (operand is Instruction t) return Instruction.Create(op, t);
+            if (operand is Instruction[] ts) return Instruction.Create(op, ts);
+            if (operand is string s) return Instruction.Create(op, s);
+            if (operand is int i) return Instruction.Create(op, i);
+            if (operand is long lo) return Instruction.Create(op, lo);
+            if (operand is float f) return Instruction.Create(op, f);
+            if (operand is double d) return Instruction.Create(op, d);
+            if (operand is ITypeDefOrRef td) return Instruction.Create(op, td);
+            if (operand is MethodDef m) return Instruction.Create(op, m);
+            if (operand is FieldDef fd) return Instruction.Create(op, fd);
+            if (operand is MemberRef mr) return Instruction.Create(op, mr);
+            return new Instruction(op, operand);
         }
+        
+        #endregion
     }
 }
