@@ -319,8 +319,8 @@ namespace Deobfuscator
 
         private bool IsConversionToInt(Instruction instr)
         {
-            return instr.OpCode.Code == Code.Conv_I4 || instr.OpCode.Code == Code.Conv_I4_1 ||
-                   instr.OpCode.Code == Code.Conv_I || instr.OpCode.Code == Code.Conv_Ovf_I4 ||
+            return instr.OpCode.Code == Code.Conv_I4 || instr.OpCode.Code == Code.Conv_I ||
+                   instr.OpCode.Code == Code.Conv_Ovf_I4 ||
                    instr.OpCode.Code == Code.Conv_Ovf_I4_Un;
         }
 

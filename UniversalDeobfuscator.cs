@@ -1,7 +1,9 @@
 using System;
 using System.IO;
+using System.Collections.Generic;
 using dnlib.DotNet;
 using dnlib.DotNet.Writer;
+using dnlib.DotNet.Emit;
 
 namespace Deobfuscator
 {
@@ -785,7 +787,7 @@ namespace Deobfuscator
                         foreach (var ins in body.Instructions)
                         {
                             if (ins.Operand == body.Instructions[i]) { isTarget = true; break; }
-                            if (ins.Operand is Instruction[] arr && arr.Contains(body.Instructions[i])) { isTarget = true; break; }
+                            if (ins.Operand is Instruction[] arr && Array.IndexOf(arr, body.Instructions[i]) >= 0) { isTarget = true; break; }
                         }
                         
                         if (!isTarget)
@@ -1018,6 +1020,99 @@ namespace Deobfuscator
             if (!char.IsLetter(n[0]) && n[0] != '_') return false;
             foreach (var c in n) if (!char.IsLetterOrDigit(c) && c != '_') return false;
             return true;
+        }
+
+        #endregion
+
+
+        #region Helper Methods
+
+        private bool IsLdloc(Instruction instr, out int index)
+        {
+            index = -1;
+            if (instr.OpCode.Code == Code.Ldloc_0) { index = 0; return true; }
+            if (instr.OpCode.Code == Code.Ldloc_1) { index = 1; return true; }
+            if (instr.OpCode.Code == Code.Ldloc_2) { index = 2; return true; }
+            if (instr.OpCode.Code == Code.Ldloc_3) { index = 3; return true; }
+            if (instr.OpCode.Code == Code.Ldloc || instr.OpCode.Code == Code.Ldloc_S)
+            {
+                if (instr.Operand is Local local)
+                {
+                    index = local.Index;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private bool IsStloc(Instruction instr, out int index)
+        {
+            index = -1;
+            if (instr.OpCode.Code == Code.Stloc_0) { index = 0; return true; }
+            if (instr.OpCode.Code == Code.Stloc_1) { index = 1; return true; }
+            if (instr.OpCode.Code == Code.Stloc_2) { index = 2; return true; }
+            if (instr.OpCode.Code == Code.Stloc_3) { index = 3; return true; }
+            if (instr.OpCode.Code == Code.Stloc || instr.OpCode.Code == Code.Stloc_S)
+            {
+                if (instr.Operand is Local local)
+                {
+                    index = local.Index;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private bool IsLdc(Instruction instr)
+        {
+            return instr.OpCode.Code == Code.Ldc_I4 || instr.OpCode.Code == Code.Ldc_I4_S ||
+                   instr.OpCode.Code == Code.Ldc_I8 || instr.OpCode.Code == Code.Ldc_R4 ||
+                   instr.OpCode.Code == Code.Ldc_R8;
+        }
+
+        private object? GetConstantValue(Instruction instr)
+        {
+            switch (instr.OpCode.Code)
+            {
+                case Code.Ldc_I4:
+                case Code.Ldc_I4_S:
+                    return instr.Operand as int?;
+                case Code.Ldc_I8:
+                    return instr.Operand as long?;
+                case Code.Ldc_R4:
+                    return instr.Operand as float?;
+                case Code.Ldc_R8:
+                    return instr.Operand as double?;
+                default:
+                    return null;
+            }
+        }
+
+        private bool? CompareValues(object? a, object? b, Code cmpOp)
+        {
+            if (a == null || b == null) return null;
+
+            try
+            {
+                double da = Convert.ToDouble(a);
+                double db = Convert.ToDouble(b);
+
+                switch (cmpOp)
+                {
+                    case Code.Ceq: return da == db;
+                    case Code.Cgt: return da > db;
+                    case Code.Clt: return da < db;
+                    case Code.Cgt_Un:
+                    case Code.Cge_Un: return da > db;
+                    case Code.Clt_Un:
+                    case Code.Cle_Un: return da < db;
+                    default: return null;
+                }
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         #endregion

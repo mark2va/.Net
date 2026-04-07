@@ -117,7 +117,7 @@ namespace Deobfuscator
             {
                 try
                 {
-                    return _ai.SuggestTypeName(type);
+                    return _ai.GetSuggestedName(type.Name, "", "Class");
                 }
                 catch { }
             }
@@ -131,7 +131,7 @@ namespace Deobfuscator
             {
                 try
                 {
-                    return _ai.SuggestMethodName(method);
+                    return _ai.GetSuggestedName(method.Name, "", method.ReturnType?.ToString() ?? "void");
                 }
                 catch { }
             }
@@ -145,7 +145,7 @@ namespace Deobfuscator
             {
                 try
                 {
-                    return _ai.SuggestFieldName(field);
+                    return _ai.GetSuggestedName(field.Name, "", field.FieldType.ToString());
                 }
                 catch { }
             }
