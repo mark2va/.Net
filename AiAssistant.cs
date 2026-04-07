@@ -9,12 +9,14 @@ namespace Deobfuscator
     {
         private readonly HttpClient _httpClient;
         private readonly AiConfig _config;
+        private readonly bool _debugMode;
         private bool _isConnected;
         private bool _isModelAvailable;
 
-        public AiAssistant(AiConfig config)
+        public AiAssistant(AiConfig config, bool debugMode = false)
         {
             _config = config;
+            _debugMode = debugMode;
             
             var handler = new HttpClientHandler
             {
@@ -27,10 +29,36 @@ namespace Deobfuscator
                 Timeout = TimeSpan.FromSeconds(config.TimeoutSeconds)
             };
             
+            if (_debugMode)
+            {
+                Console.WriteLine("[AI] Testing connection...");
+            }
+            
             _isConnected = CheckConnectionAsync().Result;
+            
+            if (_debugMode)
+            {
+                if (_isConnected)
+                    Console.WriteLine($"[AI] Connection successful to {_config.ApiUrl}");
+                else
+                    Console.WriteLine($"[AI] Connection FAILED to {_config.ApiUrl}");
+            }
+            
             if (_isConnected)
             {
+                if (_debugMode)
+                {
+                    Console.WriteLine($"[AI] Checking model '{_config.ModelName}' availability...");
+                }
                 _isModelAvailable = CheckModelAsync().Result;
+                
+                if (_debugMode)
+                {
+                    if (_isModelAvailable)
+                        Console.WriteLine($"[AI] Model '{_config.ModelName}' is available.");
+                    else
+                        Console.WriteLine($"[AI] Model '{_config.ModelName}' NOT found or API type unknown.");
+                }
             }
         }
 
