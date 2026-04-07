@@ -7,8 +7,8 @@ using dnlib.DotNet.Emit;
 namespace Deobfuscator
 {
     /// <summary>
-    /// Безопасная оптимизация математических выражений.
-    /// Вычисляет значения заранее и заменяет цепочки инструкций на константы.
+    /// Оптимизатор математических выражений с полной поддержкой арифметики и вложенности.
+    /// Вычисляет выражения вида: Convert.ToInt32(5000.0 / 50.0) или Convert.ToInt32(999.0 + Math.Tanh(500.0))
     /// </summary>
     public class MathOptimizer
     {
@@ -37,88 +37,68 @@ namespace Deobfuscator
                         var body = method.Body;
                         var instrs = body.Instructions;
 
-                        // Проходим с конца к началу
+                        // Идем с конца к началу, чтобы безопасно модифицировать список
                         for (int i = instrs.Count - 1; i >= 0; i--)
                         {
-                            var callInstr = instrs[i];
+                            var instr = instrs[i];
 
-                            // Нас интересуют только вызовы
-                            if (callInstr.OpCode.Code != Code.Call) continue;
-                            if (callInstr.Operand is not IMethodDefOrRef methodRef) continue;
+                            // Нас интересуют вызовы методов (Call, Callvirt)
+                            if (instr.OpCode.Code != Code.Call && instr.OpCode.Code != Code.Callvirt) continue;
+                            if (instr.Operand is not IMethodDefOrRef methodRef) continue;
 
                             string typeName = methodRef.DeclaringType?.FullName ?? "";
                             string methodName = methodRef.Name;
 
-                            // Работаем только с System.Math и System.Convert
+                            // Целевые классы: System.Math, System.Convert
                             if (typeName != "System.Math" && typeName != "System.Convert") continue;
 
-                            // Пытаемся вычислить результат БЕЗ изменения кода
-                            if (TrySafeEvaluate(instrs, i, methodRef, out object? result, out List<int> argIndices))
+                            // Пытаемся вычислить всё выражение, заканчивающееся на этой инструкции
+                            if (TryEvaluateExpression(instrs, i, out object? result, out List<int> consumedIndices))
                             {
-                                // Если успешно вычислили, применяем изменения
-                                
-                                // 1. Заменяем сам вызов на константу (или NOP, если void)
-                                bool hasReturn = methodRef.ReturnType?.ElementType != ElementType.Void;
-                                
-                                if (hasReturn)
+                                // Проверка безопасности: ни одна из используемых инструкций не должна быть целью перехода
+                                bool isSafe = true;
+                                foreach (var idx in consumedIndices)
                                 {
-                                    var newInstr = CreateConstantInstruction(result);
-                                    // Копируем расположение строки от старой инструкции, чтобы отладчик не сбился (опционально)
-                                    newInstr.SequencePoint = callInstr.SequencePoint;
-                                    instrs[i] = newInstr;
-                                }
-                                else
-                                {
-                                    callInstr.OpCode = OpCodes.Nop;
-                                    callInstr.Operand = null;
+                                    if (IsInstructionTarget(instrs, instrs[idx]))
+                                    {
+                                        isSafe = false;
+                                        break;
+                                    }
                                 }
 
-                                // 2. Превращаем аргументы в NOP
-                                // Мы идем в обратном порядке индексов аргументов, чтобы не сбить логику, 
-                                // хотя порядок удаления здесь не критичен, так как мы просто затираем их.
-                                foreach (int idx in argIndices)
+                                if (isSafe)
                                 {
-                                    if (idx >= 0 && idx < instrs.Count)
+                                    // 1. Заменяем сам вызов на константу
+                                    Instruction newInstr = CreateConstantInstruction(result);
+                                    instrs[i] = newInstr;
+
+                                    // 2. Превращаем аргументы и промежуточные вычисления в NOP
+                                    // Сортируем индексы по убыванию, чтобы не сбить нумерацию при замене (хотя мы меняем OpCode, а не удаляем пока)
+                                    foreach (var idx in consumedIndices.OrderByDescending(x => x))
                                     {
-                                        // Двойная проверка: не стала ли инструкция уже NOP (на всякий случай)
-                                        if (instrs[idx].OpCode.Code != Code.Nop)
+                                        if (idx != i) // Не трогаем саму инструкцию вызова, она уже заменена
                                         {
                                             instrs[idx].OpCode = OpCodes.Nop;
                                             instrs[idx].Operand = null;
                                         }
                                     }
-                                }
 
-                                totalOptimized++;
-                                globalChanged = true;
-                                
-                                string valStr = result?.ToString() ?? "null";
-                                if (valStr.Length > 40) valStr = valStr.Substring(0, 40) + "...";
-                                _log?.Invoke($"[MathOpt] {typeName}.{methodName}(...) -> {valStr}");
+                                    totalOptimized++;
+                                    globalChanged = true;
+
+                                    string valStr = result?.ToString() ?? "null";
+                                    if (valStr.Length > 40) valStr = valStr.Substring(0, 40) + "...";
+                                    _log?.Invoke($"[MathOpt] Folded {typeName}.{methodName}(...) -> {valStr}");
+                                }
                             }
                         }
 
                         if (globalChanged)
                         {
-                            // Обновляем оффсеты перед следующим проходом или выходом
+                            CleanupNops(method);
                             body.UpdateInstructionOffsets();
                         }
                     }
-                }
-
-                // Очистка NOP выполняется один раз после завершения всех циклов оптимизации метода,
-                // чтобы не усложнять логику индексов внутри цикла.
-                // Но так как у нас внешний while(globalChanged), сделаем очистку здесь для каждого прохода.
-                if (totalOptimized > 0) 
-                {
-                     // Пересобираем методы для удаления NOP
-                     foreach (var type in module.GetTypes())
-                     {
-                         foreach (var method in type.Methods)
-                         {
-                             if (method.HasBody) CleanupNops(method);
-                         }
-                     }
                 }
             }
 
@@ -126,133 +106,162 @@ namespace Deobfuscator
         }
 
         /// <summary>
-        /// Пытается безопасно вычислить выражение.
-        /// Возвращает true, если успешно, и заполняет result и список индексов аргументов.
+        /// Рекурсивно вычисляет значение выражения, заканчивающегося на index.
+        /// Возвращает результат и список индексов инструкций, которые были использованы.
         /// </summary>
-        private bool TrySafeEvaluate(IList<Instruction> instrs, int callIndex, IMethodDefOrRef methodRef, out object? result, out List<int> argIndices)
+        private bool TryEvaluateExpression(IList<Instruction> instrs, int index, out object? result, out List<int> consumedIndices)
         {
             result = null;
-            argIndices = new List<int>();
+            consumedIndices = new List<int>();
 
-            int expectedArgs = methodRef.MethodSig?.Params.Count ?? 0;
+            var currentInstr = instrs[index];
             
-            // Стек для сбора аргументов (значения)
-            // Нам нужно собрать expectedArgs аргументов.
-            // В IL аргументы лежат перед вызовом: Arg1, Arg2, ..., ArgN, Call.
-            // ArgN находится сразу перед Call (index - 1).
-            
-            List<object?> values = new List<object?>(expectedArgs);
-            int currentIndex = callIndex - 1;
-            int foundCount = 0;
-
-            while (foundCount < expectedArgs && currentIndex >= 0)
+            // Случай 1: Арифметическая операция (add, sub, mul, div, rem, and, or, xor, shl, shr)
+            if (IsArithmeticOp(currentInstr.OpCode.Code))
             {
-                var instr = instrs[currentIndex];
-
-                // Пропускаем NOP, которые могли остаться от предыдущих шагов
-                if (instr.OpCode.Code == Code.Nop)
+                // Нужно найти два операнда перед этой инструкцией
+                if (TryFindOperandValue(instrs, index - 1, out object? val1, out List<int> indices1) &&
+                    TryFindOperandValue(instrs, index - 1 - indices1.Count, out object? val2, out List<int> indices2))
                 {
-                    currentIndex--;
-                    continue;
-                }
-
-                // ВАЖНО: Проверка безопасности.
-                // Если на эту инструкцию есть ссылка (прыжок сюда), мы НЕ МОЖЕМ её удалять/заменять.
-                // Иначе сломается поток управления и dnSpy упадет.
-                if (IsInstructionReferenced(instrs, instr))
-                {
-                    return false; // Небезопасно оптимизировать
-                }
-
-                // Попытка получить константу
-                if (TryGetConstantValue(instr, out object? val))
-                {
-                    values.Add(val);
-                    argIndices.Add(currentIndex);
-                    foundCount++;
-                    currentIndex--;
-                    continue;
-                }
-
-                // Попытка рекурсивного вычисления вложенного вызова
-                if (instr.OpCode.Code == Code.Call && instr.Operand is IMethodDefOrRef nestedMethod)
-                {
-                    if (TrySafeEvaluate(instrs, currentIndex, nestedMethod, out object? nestedVal, out List<int> nestedArgs))
+                    try
                     {
-                        values.Add(nestedVal);
-                        argIndices.Add(currentIndex); // Добавляем индекс самого вызова
-                        argIndices.AddRange(nestedArgs); // Добавляем индексы его аргументов
-                        
-                        foundCount++;
-                        // Пропускаем инструкции, съеденные вложенным вызовом
-                        // Но нам нужно просто уменьшить currentIndex. 
-                        // Так как мы идем по одному индексу за шаг, а рекурсия уже собрала свои индексы в nestedArgs,
-                        // нам нужно просто продолжить цикл, ноcurrentIndex уже уменьшится на 1 в конце цикла.
-                        // Проблема: нам нужно перепрыгнуть через все аргументы вложенного вызова.
-                        // nestedArgs содержат индексы аргументов и самого вызова. Максимальный индекс там - currentIndex.
-                        // Минимальный индекс - это самый первый аргумент.
-                        // Нам нужно установить currentIndex = min(nestedArgs) - 1.
-                        
-                        if (nestedArgs.Count > 0)
+                        object? res = ExecuteArithmetic(currentInstr.OpCode.Code, val1, val2);
+                        if (res != null)
                         {
-                            int minIdx = nestedArgs.Min();
-                            currentIndex = minIdx - 1;
+                            result = res;
+                            consumedIndices.AddRange(indices2);
+                            consumedIndices.AddRange(indices1);
+                            consumedIndices.Add(index);
+                            return true;
                         }
-                        else
-                        {
-                            currentIndex--; 
-                        }
-                        continue;
+                    }
+                    catch { }
+                }
+                return false;
+            }
+
+            // Случай 2: Вызов метода (Math.*, Convert.*)
+            if ((currentInstr.OpCode.Code == Code.Call || currentInstr.OpCode.Code == Code.Callvirt) && 
+                currentInstr.Operand is IMethodDefOrRef methodRef)
+            {
+                string typeName = methodRef.DeclaringType?.FullName ?? "";
+                if (typeName != "System.Math" && typeName != "System.Convert") return false;
+
+                int argCount = methodRef.MethodSig?.Params.Count ?? 0;
+                // Для instance методов (хотя Math/Convert статические) мог бы быть this, но здесь игнорируем
+                
+                List<object?> args = new List<object?>();
+                List<int> allArgIndices = new List<int>();
+                int currentIndex = index - 1;
+
+                // Собираем аргументы справа налево (стек LIFO)
+                for (int a = 0; a < argCount; a++)
+                {
+                    if (TryFindOperandValue(instrs, currentIndex, out object? argVal, out List<int> argIndices))
+                    {
+                        args.Add(argVal);
+                        allArgIndices.AddRange(argIndices);
+                        currentIndex -= argIndices.Count;
+                    }
+                    else
+                    {
+                        return false; // Не удалось вычислить аргумент
                     }
                 }
 
-                // Если встретили что-то непонятное (переменную, поле) или не смогли вычислить вложенный вызов
-                return false;
+                args.Reverse(); // Восстанавливаем порядок аргументов
+
+                try
+                {
+                    result = ExecuteMethod(methodRef, args);
+                    consumedIndices.AddRange(allArgIndices);
+                    consumedIndices.Add(index);
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
             }
 
-            if (foundCount != expectedArgs)
+            // Случай 3: Простая константа
+            if (TryGetConstantValue(currentInstr, out object? constVal))
             {
-                return false; // Не хватило аргументов
-            }
-
-            // Аргументы собраны в обратном порядке (последний аргумент добавлен первым в список values)
-            values.Reverse();
-
-            try
-            {
-                result = ExecuteMethod(methodRef, values);
+                result = constVal;
+                consumedIndices.Add(index);
                 return true;
             }
-            catch
-            {
-                return false;
-            }
+
+            return false;
         }
 
-        private bool TryGetConstantValue(Instruction instr, out object? value)
+        /// <summary>
+        /// Пытается найти значение операнда, начиная с указанной позиции назад.
+        /// Учитывает вложенные выражения.
+        /// </summary>
+        private bool TryFindOperandValue(IList<Instruction> instrs, int startIndex, out object? value, out List<int> consumedIndices)
         {
             value = null;
-            switch (instr.OpCode.Code)
+            consumedIndices = new List<int>();
+
+            if (startIndex < 0) return false;
+
+            // Пропускаем NOP
+            int i = startIndex;
+            while (i >= 0 && instrs[i].OpCode.Code == Code.Nop)
             {
-                case Code.Ldc_I4:
-                case Code.Ldc_I4_S:
-                    value = instr.Operand as int?;
-                    return true;
-                case Code.Ldc_I8:
-                    value = instr.Operand as long?;
-                    return true;
-                case Code.Ldc_R4:
-                    value = instr.Operand as float?;
-                    return true;
-                case Code.Ldc_R8:
-                    value = instr.Operand as double?;
-                    return true;
-                case Code.Ldstr:
-                    value = instr.Operand as string;
-                    return true;
-                default:
-                    return false;
+                i--;
             }
+            if (i < 0) return false;
+
+            // Пробуем вычислить выражение, корнем которого является эта инструкция
+            if (TryEvaluateExpression(instrs, i, out object? res, out List<int> indices))
+            {
+                value = res;
+                consumedIndices = indices;
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool IsArithmeticOp(Code code)
+        {
+            return code == Code.Add || code == Code.Add_Ovf || code == Code.Add_Ovf_Un ||
+                   code == Code.Sub || code == Code.Sub_Ovf || code == Code.Sub_Ovf_Un ||
+                   code == Code.Mul || code == Code.Mul_Ovf || code == Code.Mul_Ovf_Un ||
+                   code == Code.Div || code == Code.Div_Un ||
+                   code == Code.Rem || code == Code.Rem_Un ||
+                   code == Code.And || code == Code.Or || code == Code.Xor ||
+                   code == Code.Shl || code == Code.Shr || code == Code.Shr_Un;
+        }
+
+        private object? ExecuteArithmetic(Code op, object? v1, object? v2)
+        {
+            // Приводим к double для точности вычислений с плавающей точкой
+            double d1 = Convert.ToDouble(v1 ?? 0);
+            double d2 = Convert.ToDouble(v2 ?? 0);
+
+            double res = op.Code switch
+            {
+                Code.Add => d1 + d2,
+                Code.Sub => d1 - d2,
+                Code.Mul => d1 * d2,
+                Code.Div => d1 / d2,
+                Code.Rem => d1 % d2,
+                Code.And => (double)(Convert.ToInt64(d1) & Convert.ToInt64(d2)),
+                Code.Or => (double)(Convert.ToInt64(d1) | Convert.ToInt64(d2)),
+                Code.Xor => (double)(Convert.ToInt64(d1) ^ Convert.ToInt64(d2)),
+                Code.Shl => (double)(Convert.ToInt64(d1) << (int)d2),
+                Code.Shr => (double)(Convert.ToInt64(d1) >> (int)d2),
+                _ => throw new NotSupportedException()
+            };
+
+            // Если исходные были целыми и операция целочисленная (битовая или сдвиг), возвращаем long/int
+            if (op == Code.And || op == Code.Or || op == Code.Xor || op == Code.Shl || op == Code.Shr)
+                return Convert.ToInt64(res);
+            
+            return res;
         }
 
         private object? ExecuteMethod(IMethodDefOrRef methodRef, List<object?> args)
@@ -284,9 +293,7 @@ namespace Deobfuscator
                     case "Max": return Math.Max(GetDouble(0), GetDouble(1));
                     case "Min": return Math.Min(GetDouble(0), GetDouble(1));
                     case "Pow": return Math.Pow(GetDouble(0), GetDouble(1));
-                    case "Round":
-                        if (args.Count == 2) return Math.Round(GetDouble(0), GetInt32(1));
-                        return Math.Round(GetDouble(0));
+                    case "Round": return args.Count == 2 ? Math.Round(GetDouble(0), GetInt32(1)) : Math.Round(GetDouble(0));
                     case "Sin": return Math.Sin(GetDouble(0));
                     case "Sinh": return Math.Sinh(GetDouble(0));
                     case "Sqrt": return Math.Sqrt(GetDouble(0));
@@ -317,7 +324,43 @@ namespace Deobfuscator
                 }
             }
 
-            throw new NotSupportedException($"Method {type}.{name} not supported.");
+            throw new NotSupportedException();
+        }
+
+        private bool TryGetConstantValue(Instruction instr, out object? value)
+        {
+            value = null;
+            switch (instr.OpCode.Code)
+            {
+                case Code.Ldc_I4:
+                case Code.Ldc_I4_S:
+                    value = instr.Operand as int?;
+                    return true;
+                case Code.Ldc_I8:
+                    value = instr.Operand as long?;
+                    return true;
+                case Code.Ldc_R4:
+                    value = instr.Operand as float?;
+                    return true;
+                case Code.Ldc_R8:
+                    value = instr.Operand as double?;
+                    return true;
+                case Code.Ldstr:
+                    value = instr.Operand as string;
+                    return true;
+                case Code.Ldc_I4_0: value = 0; return true;
+                case Code.Ldc_I4_1: value = 1; return true;
+                case Code.Ldc_I4_2: value = 2; return true;
+                case Code.Ldc_I4_3: value = 3; return true;
+                case Code.Ldc_I4_4: value = 4; return true;
+                case Code.Ldc_I4_5: value = 5; return true;
+                case Code.Ldc_I4_6: value = 6; return true;
+                case Code.Ldc_I4_7: value = 7; return true;
+                case Code.Ldc_I4_8: value = 8; return true;
+                case Code.Ldc_I4_M1: value = -1; return true;
+                default:
+                    return false;
+            }
         }
 
         private Instruction CreateConstantInstruction(object? value)
@@ -331,12 +374,26 @@ namespace Deobfuscator
             return OpCodes.Ldc_I4.ToInstruction(0);
         }
 
-        private bool IsInstructionReferenced(IList<Instruction> instrs, Instruction target)
+        private bool IsInstructionTarget(IList<Instruction> instrs, Instruction target)
         {
             foreach (var ins in instrs)
             {
+                // Проверка прямого операнда
                 if (ins.Operand == target) return true;
-                if (ins.Operand is Instruction[] arr && arr.Contains(target)) return true;
+                
+                // Проверка массива операндов (switch, try-catch blocks)
+                if (ins.Operand is Instruction[] arr)
+                {
+                    if (arr.Contains(target)) return true;
+                }
+                
+                // Проверка Exception Handlers
+                if (ins.Operand is ExceptionHandler eh)
+                {
+                    if (eh.TryStart == target || eh.TryEnd == target || 
+                        eh.HandlerStart == target || eh.HandlerEnd == target ||
+                        eh.FilterStart == target) return true;
+                }
             }
             return false;
         }
@@ -354,7 +411,7 @@ namespace Deobfuscator
                 {
                     if (body.Instructions[i].OpCode.Code == Code.Nop)
                     {
-                        if (!IsInstructionReferenced(body.Instructions, body.Instructions[i]))
+                        if (!IsInstructionTarget(body.Instructions, body.Instructions[i]))
                         {
                             body.Instructions.RemoveAt(i);
                             changed = true;
@@ -362,7 +419,9 @@ namespace Deobfuscator
                     }
                 }
             }
-            if (changed) body.UpdateInstructionOffsets();
+            
+            // Обновление оффсетов и пересчет ветвлений если нужно (dnlib обычно делает это сам при сохранении, но полезно для корректности в памяти)
+            body.UpdateInstructionOffsets();
         }
     }
 }
