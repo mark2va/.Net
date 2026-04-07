@@ -1,9 +1,6 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using dnlib.DotNet;
-using dnlib.DotNet.Emit;
 using dnlib.DotNet.Writer;
 
 namespace Deobfuscator
@@ -14,6 +11,10 @@ namespace Deobfuscator
         private readonly AiConfig _aiConfig;
         private readonly bool _debugMode;
         private StreamWriter? _logWriter;
+        private ControlFlowUnraveler? _cfUnraveler;
+        private MathOptimizer? _mathOptimizer;
+        private WrapperInliner? _wrapperInliner;
+        private Renamer? _renamer;
 
         public UniversalDeobfuscator(string filePath, AiConfig aiConfig, bool debugMode = false)
         {
@@ -29,6 +30,12 @@ namespace Deobfuscator
                 _logWriter.AutoFlush = true;
                 Log("=== Deobfuscation Engine Started ===");
             }
+
+            // Инициализация компонентов
+            _cfUnraveler = new ControlFlowUnraveler(debugMode ? Log : null);
+            _mathOptimizer = new MathOptimizer(debugMode ? Log : null);
+            _wrapperInliner = new WrapperInliner(debugMode ? Log : null);
+            _renamer = new Renamer(aiConfig, debugMode ? Log : null);
         }
 
         private void Log(string msg)
@@ -56,7 +63,7 @@ namespace Deobfuscator
 
                     try
                     {
-                        if (UnravelStateMachine(method))
+                        if (_cfUnraveler!.Unravel(method))
                         {
                             unraveledCount++;
                             Log($"[OK] Unraveled: {method.FullName}");
@@ -74,7 +81,8 @@ namespace Deobfuscator
 
             Log("Phase 2: Math Optimization & Constant Folding");
             Console.WriteLine("[*] Optimizing math expressions...");
-            OptimizeMathExpressions();
+            int optimizedCount = _mathOptimizer!.Optimize(_module);
+            Console.WriteLine($"[+] Optimized {optimizedCount} math expressions.");
 
             Log("Phase 3: Cleanup (NOPs & Unreachable)");
             Console.WriteLine("[*] Cleaning up dead code...");
@@ -82,11 +90,11 @@ namespace Deobfuscator
 
             Log("Phase 4: Inlining Trivial Wrappers");
             Console.WriteLine("[*] Inlining trivial wrapper methods...");
-            InlineTrivialWrappers();
+            int inlinedCount = _wrapperInliner!.Inline(_module);
 
             Log("Phase 5: Renaming");
             Console.WriteLine("[*] Renaming obfuscated items...");
-            RenameObfuscatedItems();
+            _renamer!.Rename(_module);
 
             Log("=== Deobfuscation Finished ===");
         }
@@ -1014,111 +1022,6 @@ namespace Deobfuscator
 
         #endregion
 
-        #region Helpers
-
-        private bool IsStloc(Instruction i, out int idx)
-        {
-            idx = -1;
-            if (i.Operand is Local l) idx = l.Index;
-            else if (i.OpCode.Code == Code.Stloc_0) idx = 0;
-            else if (i.OpCode.Code == Code.Stloc_1) idx = 1;
-            else if (i.OpCode.Code == Code.Stloc_2) idx = 2;
-            else if (i.OpCode.Code == Code.Stloc_3) idx = 3;
-            return idx != -1 && (i.OpCode.Code == Code.Stloc || i.OpCode.Code == Code.Stloc_S ||
-                   i.OpCode.Code >= Code.Stloc_0 && i.OpCode.Code <= Code.Stloc_3);
-        }
-
-        private bool IsLdloc(Instruction i, out int idx)
-        {
-            idx = -1;
-            if (i.Operand is Local l) idx = l.Index;
-            else if (i.OpCode.Code == Code.Ldloc_0) idx = 0;
-            else if (i.OpCode.Code == Code.Ldloc_1) idx = 1;
-            else if (i.OpCode.Code == Code.Ldloc_2) idx = 2;
-            else if (i.OpCode.Code == Code.Ldloc_3) idx = 3;
-            return idx != -1 && (i.OpCode.Code == Code.Ldloc || i.OpCode.Code == Code.Ldloc_S ||
-                   i.OpCode.Code >= Code.Ldloc_0 && i.OpCode.Code <= Code.Ldloc_3);
-        }
-
-        private bool IsLdc(Instruction i)
-        {
-            return i.OpCode.Code == Code.Ldc_I4 || i.OpCode.Code == Code.Ldc_I8 ||
-                   i.OpCode.Code == Code.Ldc_R4 || i.OpCode.Code == Code.Ldc_R8 ||
-                   (i.OpCode.Code >= Code.Ldc_I4_0 && i.OpCode.Code <= Code.Ldc_I4_M1);
-        }
-
-        private object? GetConstantValue(Instruction i)
-        {
-            switch (i.OpCode.Code)
-            {
-                case Code.Ldc_I4: return i.Operand as int?;
-                case Code.Ldc_I4_0: return 0;
-                case Code.Ldc_I4_1: return 1;
-                case Code.Ldc_I4_2: return 2;
-                case Code.Ldc_I4_3: return 3;
-                case Code.Ldc_I4_4: return 4;
-                case Code.Ldc_I4_5: return 5;
-                case Code.Ldc_I4_6: return 6;
-                case Code.Ldc_I4_7: return 7;
-                case Code.Ldc_I4_8: return 8;
-                case Code.Ldc_I4_M1: return -1;
-                case Code.Ldc_I8: return i.Operand as long?;
-                case Code.Ldc_R4: return i.Operand as float?;
-                case Code.Ldc_R8: return i.Operand as double?;
-                case Code.Ldstr: return i.Operand as string;
-                case Code.Ldnull: return null;
-                default: return null;
-            }
-        }
-
-        private bool? CompareValues(object? a, object? b, Code op)
-        {
-            if (a == null || b == null) return null;
-            try
-            {
-                if (a is long la && b is long lb)
-                {
-                    switch (op)
-                    {
-                        case Code.Ceq: return la == lb;
-                        case Code.Cgt: case Code.Cgt_Un: return la > lb;
-                        case Code.Clt: case Code.Clt_Un: return la < lb;
-                    }
-                }
-                if (a is double da && b is double db)
-                {
-                    switch (op)
-                    {
-                        case Code.Ceq: return da == db;
-                        case Code.Cgt: case Code.Cgt_Un: return da > db;
-                        case Code.Clt: case Code.Clt_Un: return da < db;
-                    }
-                }
-                else if (a is float fa && b is float fb)
-                {
-                    switch (op)
-                    {
-                        case Code.Ceq: return fa == fb;
-                        case Code.Cgt: case Code.Cgt_Un: return fa > fb;
-                        case Code.Clt: case Code.Clt_Un: return fa < fb;
-                    }
-                }
-                else
-                {
-                    double da = Convert.ToDouble(a);
-                    double db = Convert.ToDouble(b);
-                    switch (op)
-                    {
-                        case Code.Ceq: return da == db;
-                        case Code.Cgt: case Code.Cgt_Un: return da > db;
-                        case Code.Clt: case Code.Clt_Un: return da < db;
-                    }
-                }
-            } catch { }
-            return null;
-        }
-
-        #endregion
 
         public void Save(string path)
         {
