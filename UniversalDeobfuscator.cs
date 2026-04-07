@@ -74,11 +74,19 @@ namespace Deobfuscator
 
             Console.WriteLine($"[+] Unraveled {unraveledCount} methods. ({failedCount} failed/skipped)");
 
-            Log("Phase 2: Cleanup (NOPs & Unreachable)");
+            Log("Phase 2: Math Optimization & Constant Folding");
+            Console.WriteLine("[*] Optimizing math expressions...");
+            OptimizeMathExpressions();
+
+            Log("Phase 3: Cleanup (NOPs & Unreachable)");
             Console.WriteLine("[*] Cleaning up dead code...");
             CleanupAll();
 
-            Log("Phase 3: Renaming");
+            Log("Phase 4: Inlining Trivial Wrappers");
+            Console.WriteLine("[*] Inlining trivial wrapper methods...");
+            InlineTrivialWrappers();
+
+            Log("Phase 5: Renaming");
             Console.WriteLine("[*] Renaming obfuscated items...");
             RenameObfuscatedItems();
 
@@ -391,6 +399,326 @@ namespace Deobfuscator
             // Здесь можно добавить логику для простых замен констант, если нужно.
             // Для начала полагаемся на основной алгоритм.
             return false;
+        }
+
+        /// <summary>
+        /// Оптимизация математических выражений и сворачивание констант.
+        /// Вычисляет выражения вроде Convert.ToInt32(14.0 - Math.Ceiling(4.5)) на этапе деобфускации.
+        /// </summary>
+        private void OptimizeMathExpressions()
+        {
+            int optimizedCount = 0;
+
+            foreach (var type in _module.GetTypes())
+            {
+                foreach (var method in type.Methods)
+                {
+                    if (!method.HasBody || !method.Body.IsIL) continue;
+
+                    var body = method.Body;
+                    var instrs = body.Instructions;
+                    bool changed = true;
+
+                    while (changed)
+                    {
+                        changed = false;
+
+                        for (int i = 0; i < instrs.Count - 1; i++)
+                        {
+                            var instr = instrs[i];
+
+                            // Паттерн: ldc.r4/r8, call Math.Ceiling/Floor/Round, conv.i4
+                            if (IsLdc(instr) && i + 2 < instrs.Count)
+                            {
+                                var next1 = instrs[i + 1];
+                                var next2 = instrs[i + 2];
+
+                                // Проверка вызова Math.Ceiling, Math.Floor, Math.Round
+                                if (next1.OpCode.Code == Code.Call && next1.Operand is IMethodDefOrRef mathMethod)
+                                {
+                                    string methodName = mathMethod.Name;
+                                    string typeName = mathMethod.DeclaringType?.FullName ?? "";
+
+                                    if (typeName == "System.Math" && (methodName == "Ceiling" || methodName == "Floor" || methodName == "Round"))
+                                    {
+                                        object? value = GetConstantValue(instr);
+                                        if (value != null)
+                                        {
+                                            double result = 0;
+                                            try
+                                            {
+                                                double dVal = Convert.ToDouble(value);
+                                                if (methodName == "Ceiling") result = Math.Ceiling(dVal);
+                                                else if (methodName == "Floor") result = Math.Floor(dVal);
+                                                else if (methodName == "Round") result = Math.Round(dVal);
+
+                                                // Проверяем, есть ли дальше conv.i4 или подобное
+                                                if (i + 3 < instrs.Count && IsConversionToInt(next2))
+                                                {
+                                                    int finalResult = Convert.ToInt32(result);
+                                                    
+                                                    // Заменяем всю цепочку на один ldc.i4
+                                                    instr.OpCode = OpCodes.Ldc_I4;
+                                                    instr.Operand = finalResult;
+                                                    
+                                                    next1.OpCode = OpCodes.Nop;
+                                                    next1.Operand = null;
+                                                    next2.OpCode = OpCodes.Nop;
+                                                    next2.Operand = null;
+
+                                                    // Если есть conv.i4 после, его тоже убираем
+                                                    if (i + 3 < instrs.Count && IsConversionToInt(instrs[i + 2]))
+                                                    {
+                                                        instrs[i + 2].OpCode = OpCodes.Nop;
+                                                        instrs[i + 2].Operand = null;
+                                                    }
+
+                                                    changed = true;
+                                                    optimizedCount++;
+                                                    Log($"  Optimized Math.{methodName}({value}) -> {finalResult}");
+                                                }
+                                                else if (i + 2 < instrs.Count && next2.OpCode.Code == Code.Nop)
+                                                {
+                                                    // Если conv уже был удален, просто заменяем на ldc.r8 с результатом
+                                                    instr.OpCode = OpCodes.Ldc_R8;
+                                                    instr.Operand = result;
+                                                    next1.OpCode = OpCodes.Nop;
+                                                    next1.Operand = null;
+                                                    changed = true;
+                                                    optimizedCount++;
+                                                }
+                                            }
+                                            catch { }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Более общий случай: любые арифметические операции с константами
+                            // add, sub, mul, div с двумя константами на стеке
+                            if ((instr.OpCode.Code == Code.Add || instr.OpCode.Code == Code.Sub || 
+                                 instr.OpCode.Code == Code.Mul || instr.OpCode.Code == Code.Div) && i >= 2)
+                            {
+                                var prev1 = instrs[i - 1];
+                                var prev2 = instrs[i - 2];
+
+                                if (IsLdc(prev1) && IsLdc(prev2))
+                                {
+                                    object? val1 = GetConstantValue(prev2);
+                                    object? val2 = GetConstantValue(prev1);
+
+                                    if (val1 != null && val2 != null)
+                                    {
+                                        try
+                                        {
+                                            object? result = null;
+                                            Code resultCode = Code.Ldc_I4;
+
+                                            if (val1 is int i1 && val2 is int i2)
+                                            {
+                                                if (instr.OpCode.Code == Code.Add) result = i1 + i2;
+                                                else if (instr.OpCode.Code == Code.Sub) result = i1 - i2;
+                                                else if (instr.OpCode.Code == Code.Mul) result = i1 * i2;
+                                                else if (instr.OpCode.Code == Code.Div && i2 != 0) result = i1 / i2;
+                                            }
+                                            else if ((val1 is long l1 && val2 is long l2) || 
+                                                     (val1 is int i1l && val2 is long l2l))
+                                            {
+                                                long vl1 = Convert.ToInt64(val1);
+                                                long vl2 = Convert.ToInt64(val2);
+                                                if (instr.OpCode.Code == Code.Add) result = vl1 + vl2;
+                                                else if (instr.OpCode.Code == Code.Sub) result = vl1 - vl2;
+                                                else if (instr.OpCode.Code == Code.Mul) result = vl1 * vl2;
+                                                else if (instr.OpCode.Code == Code.Div && vl2 != 0) result = vl1 / vl2;
+                                                resultCode = Code.Ldc_I8;
+                                            }
+                                            else if ((val1 is double d1 && val2 is double d2) ||
+                                                     (val1 is float f1 && val2 is float f2))
+                                            {
+                                                double vd1 = Convert.ToDouble(val1);
+                                                double vd2 = Convert.ToDouble(val2);
+                                                if (instr.OpCode.Code == Code.Add) result = vd1 + vd2;
+                                                else if (instr.OpCode.Code == Code.Sub) result = vd1 - vd2;
+                                                else if (instr.OpCode.Code == Code.Mul) result = vd1 * vd2;
+                                                else if (instr.OpCode.Code == Code.Div && vd2 != 0) result = vd1 / vd2;
+                                                resultCode = Code.Ldc_R8;
+                                            }
+
+                                            if (result != null)
+                                            {
+                                                prev2.OpCode = resultCode == Code.Ldc_I8 ? OpCodes.Ldc_I8 : 
+                                                               resultCode == Code.Ldc_R8 ? OpCodes.Ldc_R8 : OpCodes.Ldc_I4;
+                                                prev2.Operand = result;
+                                                
+                                                prev1.OpCode = OpCodes.Nop;
+                                                prev1.Operand = null;
+                                                
+                                                instr.OpCode = OpCodes.Nop;
+                                                instr.Operand = null;
+
+                                                changed = true;
+                                                optimizedCount++;
+                                                Log($"  Folded constant: {val1} {instr.OpCode.Name} {val2} -> {result}");
+                                            }
+                                        }
+                                        catch { }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (changed)
+                        {
+                            CleanupNops(method);
+                            body.UpdateInstructionOffsets();
+                        }
+                    }
+                }
+            }
+
+            Console.WriteLine($"[+] Optimized {optimizedCount} math expressions.");
+        }
+
+        private bool IsConversionToInt(Instruction instr)
+        {
+            return instr.OpCode.Code == Code.Conv_I4 || instr.OpCode.Code == Code.Conv_I ||
+                   instr.OpCode.Code == Code.Conv_Ovf_I4 || instr.OpCode.Code == Code.Conv_Ovf_I4_Un ||
+                   instr.OpCode.Code == Code.Stelem_I4 || instr.OpCode.Code == Code.Box && 
+                   instr.Operand is TypeDef td && td.FullName == "System.Int32";
+        }
+
+        /// <summary>
+        /// Находит и упрощает методы-обёртки, которые просто вызывают другие методы.
+        /// Например: The(A, B) -> Item_BE3A.The(A, B)
+        /// </summary>
+        private void InlineTrivialWrappers()
+        {
+            var wrappers = new Dictionary<MethodDef, MethodDef>();
+            int inlinedCount = 0;
+
+            // Сначала найдем все методы-обёртки
+            foreach (var type in _module.GetTypes())
+            {
+                foreach (var method in type.Methods)
+                {
+                    if (!method.HasBody || !method.Body.IsIL) continue;
+                    if (method.Body.Instructions.Count > 10) continue; // Обёртки обычно очень короткие
+
+                    var instrs = method.Body.Instructions;
+                    
+                    // Паттерн обёртки:
+                    // 1. Несколько starg/stloc для параметров (опционально)
+                    // 2. Один вызов call/callvirt
+                    // 3. ret
+                    // ИЛИ просто: call + ret
+                    
+                    int callIndex = -1;
+                    IMethodDefOrRef? targetMethod = null;
+
+                    for (int i = 0; i < instrs.Count; i++)
+                    {
+                        if (instrs[i].OpCode.Code == Code.Call || instrs[i].OpCode.Code == Code.Callvirt)
+                        {
+                            if (callIndex == -1)
+                            {
+                                callIndex = i;
+                                targetMethod = instrs[i].Operand as IMethodDefOrRef;
+                            }
+                            else
+                            {
+                                // Больше одного вызова - не простая обёртка
+                                callIndex = -1;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Проверяем, что после вызова только ret
+                    bool isWrapper = callIndex >= 0 && targetMethod != null;
+                    if (isWrapper)
+                    {
+                        for (int i = callIndex + 1; i < instrs.Count; i++)
+                        {
+                            if (instrs[i].OpCode.Code != Code.Ret && instrs[i].OpCode.Code != Code.Nop)
+                            {
+                                isWrapper = false;
+                                break;
+                            }
+                        }
+                        
+                        // Проверяем, что перед вызовом только загрузка аргументов или nop
+                        if (isWrapper)
+                        {
+                            for (int i = 0; i < callIndex; i++)
+                            {
+                                var code = instrs[i].OpCode.Code;
+                                if (code != Code.Ldarg && code != Code.Ldarg_0 && code != Code.Ldarg_1 && 
+                                    code != Code.Ldarg_2 && code != Code.Ldarg_3 && code != Code.Ldarg_S &&
+                                    code != Code.Nop && code != Code.Stloc && code != Code.Stloc_S &&
+                                    code != Code.Ldloc && code != Code.Ldloc_S && code != Code.Ldloc_0 &&
+                                    code != Code.Ldloc_1 && code != Code.Ldloc_2 && code != Code.Ldloc_3)
+                                {
+                                    isWrapper = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (isWrapper && targetMethod != null)
+                    {
+                        // Находим определение целевого метода
+                        var targetDef = targetMethod.ResolveToken();
+                        if (targetDef is MethodDef targetMethodDef && targetMethodDef != method)
+                        {
+                            wrappers[method] = targetMethodDef;
+                            Log($"  Found wrapper: {method.FullName} -> {targetMethodDef.FullName}");
+                        }
+                    }
+                }
+            }
+
+            // Теперь заменяем вызовы обёрток на вызовы целевых методов
+            if (wrappers.Count > 0)
+            {
+                bool changed = true;
+                int maxIterations = 10; // Защита от бесконечных циклов
+                int iteration = 0;
+
+                while (changed && iteration < maxIterations)
+                {
+                    changed = false;
+                    iteration++;
+
+                    foreach (var type in _module.GetTypes())
+                    {
+                        foreach (var method in type.Methods)
+                        {
+                            if (!method.HasBody || !method.Body.IsIL) continue;
+
+                            var instrs = method.Body.Instructions;
+                            for (int i = 0; i < instrs.Count; i++)
+                            {
+                                if ((instrs[i].OpCode.Code == Code.Call || instrs[i].OpCode.Code == Code.Callvirt) &&
+                                    instrs[i].Operand is IMethodDefOrRef calledMethod)
+                                {
+                                    var calledDef = calledMethod.ResolveToken();
+                                    if (calledDef is MethodDef calledMethodDef && wrappers.ContainsKey(calledMethodDef))
+                                    {
+                                        var target = wrappers[calledMethodDef];
+                                        instrs[i].Operand = target;
+                                        changed = true;
+                                        inlinedCount++;
+                                        Log($"    Inlined: {calledMethodDef.FullName} -> {target.FullName}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Console.WriteLine($"[+] Inlined {inlinedCount} wrapper calls across {wrappers.Count} wrapper methods.");
         }
 
         private void CleanupAll()
