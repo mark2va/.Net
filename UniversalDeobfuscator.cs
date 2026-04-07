@@ -52,7 +52,7 @@ namespace Deobfuscator
             {
                 foreach (var method in type.Methods)
                 {
-                    if (!method.HasBody || !method.Body.IsIL) continue;
+                    if (!method.HasBody || !method.Body.HasInstructions) continue;
                     if (method.Body.Instructions.Count < 5) continue;
 
                     try
@@ -268,7 +268,7 @@ namespace Deobfuscator
                     int nextIp = ip + 1;
                     if (nextIp < instructions.Count) queue.Enqueue(Tuple.Create(nextIp, currentState));
                 }
-                else if (instr.OpCode.FlowControl == FlowControl.Ret || instr.OpCode.FlowControl == FlowControl.Throw)
+                else if (instr.OpCode.FlowControl == FlowControl.Return || instr.OpCode.FlowControl == FlowControl.Throw)
                 {
                     // Конец пути
                 }
@@ -457,7 +457,7 @@ namespace Deobfuscator
 
                 // Следующая инструкция
                 if (curr.OpCode.FlowControl != FlowControl.Branch && 
-                    curr.OpCode.FlowControl != FlowControl.Ret && 
+                    curr.OpCode.FlowControl != FlowControl.Return && 
                     curr.OpCode.FlowControl != FlowControl.Throw)
                 {
                     if (idx + 1 < body.Instructions.Count)
@@ -690,8 +690,8 @@ namespace Deobfuscator
                 else
                 {
                     // fallback to double для int/long
-                    double da = Convert.ToDouble(a);
-                    double db = Convert.ToDouble(b);
+                    da = Convert.ToDouble(a);
+                    db = Convert.ToDouble(b);
                     switch (op)
                     {
                         case Code.Ceq: return da == db;
