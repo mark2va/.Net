@@ -47,17 +47,15 @@ namespace Deobfuscator
             int unraveledCount = 0;
             int failedCount = 0;
 
-            // Проходим по всем типам и методам
             foreach (var type in _module.GetTypes())
             {
                 foreach (var method in type.Methods)
                 {
-                    if (!method.HasBody || !method.Body.HasInstructions) continue;
+                    if (!method.HasBody || !method.Body.IsIL) continue;
                     if (method.Body.Instructions.Count < 5) continue;
 
                     try
                     {
-                        // Попытка распутать метод
                         if (UnravelStateMachine(method))
                         {
                             unraveledCount++;
@@ -102,19 +100,16 @@ namespace Deobfuscator
             var instrs = body.Instructions;
             
             // 1. Поиск переменной состояния (State Variable)
-            // Ищем локаль, которая часто используется в паттернах: stloc, ldloc + ldc + ceq
             int? stateVarIndex = FindStateVariable(method);
             
             if (!stateVarIndex.HasValue)
             {
-                // Если явной переменной состояния нет, пробуем упрощенный анализ потока (для простых случаев)
                 return SimplifyControlFlowBasic(method);
             }
 
             Log($"  Found state variable: V_{stateVarIndex.Value}");
 
             // 2. Символьное выполнение для вычисления значений состояния
-            // Возвращает словарь: Индекс инструкции -> Значение состояния ПЕРЕД этой инструкцией
             var stateMap = SymbolicExecuteState(method, stateVarIndex.Value);
 
             if (stateMap.Count == 0)
@@ -126,15 +121,13 @@ namespace Deobfuscator
             bool changed = false;
 
             // 3. Упрощение ветвлений на основе карты состояний
-            // Проходим с конца, чтобы безопасно удалять/менять инструкции
             for (int i = instrs.Count - 1; i >= 0; i--)
             {
                 var instr = instrs[i];
 
-                // А. Удаляем записи в переменную состояния (они больше не нужны)
+                // А. Удаляем записи в переменную состояния
                 if (IsStloc(instr, out int sIdx) && sIdx == stateVarIndex.Value)
                 {
-                    // Также удаляем константу перед записью, если она есть
                     if (i > 0 && IsLdc(instrs[i - 1]))
                     {
                         instrs[i - 1].OpCode = OpCodes.Nop;
@@ -146,8 +139,7 @@ namespace Deobfuscator
                     continue;
                 }
 
-                // Б. Упрощаем условные переходы, зависящие от состояния
-                // Паттерн: ldloc(state), ldc(val), ceq/cgt/clt, brtrue/brfalse
+                // Б. Упрощаем условные переходы
                 if (instr.OpCode.FlowControl == FlowControl.Cond_Branch)
                 {
                     if (TryResolveBranch(instrs, i, stateMap, stateVarIndex.Value))
@@ -159,7 +151,6 @@ namespace Deobfuscator
 
             if (changed)
             {
-                // Финальная очистка NOP и обновление оффсетов
                 CleanupNops(method);
                 RemoveUnreachableBlocks(method);
                 body.UpdateInstructionOffsets();
@@ -178,7 +169,6 @@ namespace Deobfuscator
 
             for (int i = 0; i < instructions.Count - 3; i++)
             {
-                // Паттерн: ldloc X, ldc Y, ceq, br...
                 if (IsLdloc(instructions[i], out int idx))
                 {
                     var next = instructions[i + 1];
@@ -193,7 +183,6 @@ namespace Deobfuscator
                 }
             }
 
-            // Переменная считается состоянием, если участвует в >= 3 таких сравнениях
             foreach (var kvp in usageCount)
             {
                 if (kvp.Value >= 3) return kvp.Key;
@@ -210,10 +199,8 @@ namespace Deobfuscator
             var stateValues = new Dictionary<int, object?>();
             var instructions = method.Body.Instructions;
             
-            // Очередь для обхода графа: (Индекс инструкции, Текущее значение состояния)
             var queue = new Queue<Tuple<int, object?>>();
             
-            // Попытка найти начальное значение (первое присваивание стейту)
             object? initialState = null;
             int startIp = 0;
 
@@ -234,7 +221,7 @@ namespace Deobfuscator
 
             queue.Enqueue(Tuple.Create(startIp, initialState));
             
-            var visited = new HashSet<int>(); // Посещенные IP
+            var visited = new HashSet<int>();
 
             while (queue.Count > 0)
             {
@@ -246,13 +233,11 @@ namespace Deobfuscator
                 if (visited.Contains(ip)) continue;
                 visited.Add(ip);
 
-                // Сохраняем состояние для этой точки
                 if (!stateValues.ContainsKey(ip))
                     stateValues[ip] = currentState;
 
                 var instr = instructions[ip];
 
-                // Эмуляция перехода
                 if (instr.OpCode.FlowControl == FlowControl.Branch)
                 {
                     if (instr.Operand is Instruction target)
@@ -263,29 +248,22 @@ namespace Deobfuscator
                 }
                 else if (instr.OpCode.FlowControl == FlowControl.Cond_Branch)
                 {
-                    // В символьном выполнении мы идем по ОБЕИМ веткам, так как условие может быть истинным или ложным
-                    // Но значение состояния остается тем же до точки изменения.
-                    
-                    // Ветка 1: Target
                     if (instr.Operand is Instruction target)
                     {
                         int targetIp = instructions.IndexOf(target);
                         if (targetIp != -1) queue.Enqueue(Tuple.Create(targetIp, currentState));
                     }
-                    // Ветка 2: Next
                     int nextIp = ip + 1;
                     if (nextIp < instructions.Count) queue.Enqueue(Tuple.Create(nextIp, currentState));
                 }
-                else if (instr.OpCode.FlowControl == FlowControl.Return || instr.OpCode.FlowControl == FlowControl.Throw)
+                else if (instr.OpCode.FlowControl == FlowControl.Ret || instr.OpCode.FlowControl == FlowControl.Throw)
                 {
                     // Конец пути
                 }
                 else
                 {
-                    // Обычная инструкция. Проверка на изменение состояния.
                     object? nextState = currentState;
                     
-                    // Если это stloc state, обновляем состояние для следующей инструкции
                     if (IsStloc(instr, out int sIdx) && sIdx == stateVarIndex)
                     {
                         if (ip > 0 && IsLdc(instructions[ip - 1]))
@@ -312,21 +290,16 @@ namespace Deobfuscator
         {
             var branchInstr = instrs[branchIp];
             
-            // Нам нужно найти условие перед ветвлением.
-            // Обычно это: ... ldloc(state), ldc(val), ceq, brtrue ...
-            // Ищем назад от branchInstr
             int lookback = 0;
             int cmpIp = -1;
             int ldcIp = -1;
             int ldlocIp = -1;
 
-            // Простой парсер стека назад
-            // Ожидаем: [Branch] <- [Cmp] <- [Ldc] <- [Ldloc(State)]
             if (branchIp >= 3)
             {
-                var i1 = instrs[branchIp - 1]; // Cmp?
-                var i2 = instrs[branchIp - 2]; // Ldc?
-                var i3 = instrs[branchIp - 3]; // Ldloc?
+                var i1 = instrs[branchIp - 1];
+                var i2 = instrs[branchIp - 2];
+                var i3 = instrs[branchIp - 3];
 
                 if ((i1.OpCode.Code == Code.Ceq || i1.OpCode.Code == Code.Cgt || i1.OpCode.Code == Code.Clt || 
                      i1.OpCode.Code == Code.Cgt_Un || i1.OpCode.Code == Code.Clt_Un) &&
@@ -340,7 +313,6 @@ namespace Deobfuscator
 
             if (cmpIp == -1) return false;
 
-            // Получаем известное значение состояния перед ldloc
             if (!stateMap.TryGetValue(ldlocIp, out object? currentState))
                 return false;
 
@@ -348,21 +320,18 @@ namespace Deobfuscator
             if (compareValue == null || currentState == null)
                 return false;
 
-            // Вычисляем результат сравнения
             bool? result = CompareValues(currentState, compareValue, instrs[cmpIp].OpCode.Code);
 
             if (result.HasValue)
             {
                 if (result.Value)
                 {
-                    // Условие истинно -> превращаем в безусловный переход
                     Log($"    Resolved branch at {branchIp}: TRUE -> br");
                     branchInstr.OpCode = OpCodes.Br;
                     if (branchInstr.OpCode.Code == Code.Brtrue_S || branchInstr.OpCode.Code == Code.Brfalse_S)
                          branchInstr.OpCode = OpCodes.Br_S;
                     else branchInstr.OpCode = OpCodes.Br;
                     
-                    // Очищаем инструкции условия (ldloc, ldc, ceq) - они больше не нужны
                     instrs[ldlocIp].OpCode = OpCodes.Nop;
                     instrs[ldlocIp].Operand = null;
                     instrs[ldcIp].OpCode = OpCodes.Nop;
@@ -372,12 +341,10 @@ namespace Deobfuscator
                 }
                 else
                 {
-                    // Условие ложно -> превращаем в NOP (переход не сработает)
                     Log($"    Resolved branch at {branchIp}: FALSE -> nop");
                     branchInstr.OpCode = OpCodes.Nop;
                     branchInstr.Operand = null;
                     
-                    // Очищаем инструкции условия (ldloc, ldc, ceq) - они больше не нужны
                     instrs[ldlocIp].OpCode = OpCodes.Nop;
                     instrs[ldlocIp].Operand = null;
                     instrs[ldcIp].OpCode = OpCodes.Nop;
@@ -391,19 +358,13 @@ namespace Deobfuscator
             return false;
         }
 
-        /// <summary>
-        /// Базовое упрощение для методов без явной переменной состояния (упрощение констант).
-        /// </summary>
         private bool SimplifyControlFlowBasic(MethodDef method)
         {
-            // Здесь можно добавить логику для простых замен констант, если нужно.
-            // Для начала полагаемся на основной алгоритм.
             return false;
         }
 
         /// <summary>
         /// Оптимизация математических выражений и сворачивание констант.
-        /// Вычисляет выражения вроде Convert.ToInt32(14.0 - Math.Ceiling(4.5)) на этапе деобфускации.
         /// </summary>
         private void OptimizeMathExpressions()
         {
@@ -433,7 +394,6 @@ namespace Deobfuscator
                                 var next1 = instrs[i + 1];
                                 var next2 = instrs[i + 2];
 
-                                // Проверка вызова Math.Ceiling, Math.Floor, Math.Round
                                 if (next1.OpCode.Code == Code.Call && next1.Operand is IMethodDefOrRef mathMethod)
                                 {
                                     string methodName = mathMethod.Name;
@@ -452,12 +412,10 @@ namespace Deobfuscator
                                                 else if (methodName == "Floor") result = Math.Floor(dVal);
                                                 else if (methodName == "Round") result = Math.Round(dVal);
 
-                                                // Проверяем, есть ли дальше conv.i4 или подобное
                                                 if (i + 3 < instrs.Count && IsConversionToInt(next2))
                                                 {
                                                     int finalResult = Convert.ToInt32(result);
                                                     
-                                                    // Заменяем всю цепочку на один ldc.i4
                                                     instr.OpCode = OpCodes.Ldc_I4;
                                                     instr.Operand = finalResult;
                                                     
@@ -466,7 +424,6 @@ namespace Deobfuscator
                                                     next2.OpCode = OpCodes.Nop;
                                                     next2.Operand = null;
 
-                                                    // Если есть conv.i4 после, его тоже убираем
                                                     if (i + 3 < instrs.Count && IsConversionToInt(instrs[i + 2]))
                                                     {
                                                         instrs[i + 2].OpCode = OpCodes.Nop;
@@ -479,7 +436,6 @@ namespace Deobfuscator
                                                 }
                                                 else if (i + 2 < instrs.Count && next2.OpCode.Code == Code.Nop)
                                                 {
-                                                    // Если conv уже был удален, просто заменяем на ldc.r8 с результатом
                                                     instr.OpCode = OpCodes.Ldc_R8;
                                                     instr.Operand = result;
                                                     next1.OpCode = OpCodes.Nop;
@@ -494,8 +450,7 @@ namespace Deobfuscator
                                 }
                             }
 
-                            // Более общий случай: любые арифметические операции с константами
-                            // add, sub, mul, div с двумя константами на стеке
+                            // Арифметические операции с константами
                             if ((instr.OpCode.Code == Code.Add || instr.OpCode.Code == Code.Sub || 
                                  instr.OpCode.Code == Code.Mul || instr.OpCode.Code == Code.Div) && i >= 2)
                             {
@@ -588,29 +543,21 @@ namespace Deobfuscator
         }
 
         /// <summary>
-        /// Находит и упрощает методы-обёртки, которые просто вызывают другие методы.
-        /// Например: The(A, B) -> Item_BE3A.The(A, B)
+        /// Находит и упрощает методы-обёртки.
         /// </summary>
         private void InlineTrivialWrappers()
         {
             var wrappers = new Dictionary<MethodDef, MethodDef>();
             int inlinedCount = 0;
 
-            // Сначала найдем все методы-обёртки
             foreach (var type in _module.GetTypes())
             {
                 foreach (var method in type.Methods)
                 {
                     if (!method.HasBody || !method.Body.IsIL) continue;
-                    if (method.Body.Instructions.Count > 10) continue; // Обёртки обычно очень короткие
+                    if (method.Body.Instructions.Count > 10) continue;
 
                     var instrs = method.Body.Instructions;
-                    
-                    // Паттерн обёртки:
-                    // 1. Несколько starg/stloc для параметров (опционально)
-                    // 2. Один вызов call/callvirt
-                    // 3. ret
-                    // ИЛИ просто: call + ret
                     
                     int callIndex = -1;
                     IMethodDefOrRef? targetMethod = null;
@@ -626,14 +573,12 @@ namespace Deobfuscator
                             }
                             else
                             {
-                                // Больше одного вызова - не простая обёртка
                                 callIndex = -1;
                                 break;
                             }
                         }
                     }
 
-                    // Проверяем, что после вызова только ret
                     bool isWrapper = callIndex >= 0 && targetMethod != null;
                     if (isWrapper)
                     {
@@ -646,7 +591,6 @@ namespace Deobfuscator
                             }
                         }
                         
-                        // Проверяем, что перед вызовом только загрузка аргументов или nop
                         if (isWrapper)
                         {
                             for (int i = 0; i < callIndex; i++)
@@ -667,7 +611,6 @@ namespace Deobfuscator
 
                     if (isWrapper && targetMethod != null)
                     {
-                        // Находим определение целевого метода
                         var targetDef = targetMethod.ResolveToken();
                         if (targetDef is MethodDef targetMethodDef && targetMethodDef != method)
                         {
@@ -678,11 +621,10 @@ namespace Deobfuscator
                 }
             }
 
-            // Теперь заменяем вызовы обёрток на вызовы целевых методов
             if (wrappers.Count > 0)
             {
                 bool changed = true;
-                int maxIterations = 10; // Защита от бесконечных циклов
+                int maxIterations = 10;
                 int iteration = 0;
 
                 while (changed && iteration < maxIterations)
@@ -748,7 +690,6 @@ namespace Deobfuscator
                 {
                     if (body.Instructions[i].OpCode.Code == Code.Nop)
                     {
-                        // Проверяем, не является ли эта инструкция целью перехода
                         bool isTarget = false;
                         foreach (var ins in body.Instructions)
                         {
@@ -783,9 +724,8 @@ namespace Deobfuscator
                 int idx = body.Instructions.IndexOf(curr);
                 if (idx == -1) continue;
 
-                // Следующая инструкция
                 if (curr.OpCode.FlowControl != FlowControl.Branch && 
-                    curr.OpCode.FlowControl != FlowControl.Return && 
+                    curr.OpCode.FlowControl != FlowControl.Ret && 
                     curr.OpCode.FlowControl != FlowControl.Throw)
                 {
                     if (idx + 1 < body.Instructions.Count)
@@ -795,7 +735,6 @@ namespace Deobfuscator
                     }
                 }
 
-                // Цели переходов
                 if (curr.Operand is Instruction t)
                 {
                     if (reachable.Add(t)) q.Enqueue(t);
@@ -806,7 +745,6 @@ namespace Deobfuscator
                 }
             }
 
-            // Замена недостижимого на NOP
             bool changed = false;
             for (int i = body.Instructions.Count - 1; i >= 0; i--)
             {
@@ -853,7 +791,6 @@ namespace Deobfuscator
             int paramCounter = 1;
             int localVarCounter = 1;
 
-            // Сначала соберем все элементы для переименования, чтобы показать прогресс
             var itemsToRename = new List<(string Type, object Item, string OldName)>();
             
             foreach (var type in _module.GetTypes())
@@ -873,7 +810,6 @@ namespace Deobfuscator
                             itemsToRename.Add(("Param", param, param.Name));
                     }
                     
-                    // Сбор локальных переменных для переименования
                     if (method.HasBody && method.Body.HasVariables)
                     {
                         foreach (var local in method.Body.Variables)
@@ -895,13 +831,11 @@ namespace Deobfuscator
             int current = 0;
             int lastProgress = -1;
 
-            // Обработка с прогресс-баром
             foreach (var item in itemsToRename)
             {
                 current++;
                 int progress = (int)((current * 100) / total);
                 
-                // Обновляем прогресс только если изменился на 5% или больше
                 if (progress % 5 == 0 && progress != lastProgress)
                 {
                     lastProgress = progress;
@@ -953,27 +887,23 @@ namespace Deobfuscator
 
         private string GenerateAiName(AiAssistant ai, string oldName, string type, string context)
         {
-            return $"Item_{oldName.GetHashCode().ToString("X").Substring(0, 4)}"; // Заглушка, если нужно
+            return $"Item_{oldName.GetHashCode().ToString("X").Substring(0, 4)}";
         }
 
         private bool IsObfuscatedName(string name)
         {
             if (string.IsNullOrEmpty(name)) return false;
-            if (name.StartsWith("<")) return false; // Сгенерированные компилятором (свойства, лямбды)
+            if (name.StartsWith("<")) return false;
             
-            // Если имя содержит символы вне диапазона ASCII (латиница, цифры, _), это признак обфускации
-            // Особенно актуально для случаев с арабскими/персидскими символами и прочими Unicode-знаками
             foreach (char c in name)
             {
-                if (c > 127) return true; // Любой символ с кодом > 127 считаем подозрительным
+                if (c > 127) return true;
                 if (c == '_' || char.IsDigit(c)) continue;
-                if (!char.IsLetter(c)) return true; // Странные символы в ASCII диапазоне
+                if (!char.IsLetter(c)) return true;
             }
 
-            // Короткие имена из 1-2 букв (a, b, aa, a1) тоже часто признак обфускации
             if (name.Length <= 2 && name.All(char.IsLetter)) return true;
             
-            // Паттерны типа a1, b99
             if (System.Text.RegularExpressions.Regex.IsMatch(name, @"^[a-z]{1,2}\d+$")) return true;
             
             return false;
@@ -1063,7 +993,6 @@ namespace Deobfuscator
             if (a == null || b == null) return null;
             try
             {
-                // Поддержка long (Int64)
                 if (a is long la && b is long lb)
                 {
                     switch (op)
@@ -1073,7 +1002,6 @@ namespace Deobfuscator
                         case Code.Clt: case Code.Clt_Un: return la < lb;
                     }
                 }
-                // Поддержка double и float
                 if (a is double da && b is double db)
                 {
                     switch (op)
@@ -1094,9 +1022,8 @@ namespace Deobfuscator
                 }
                 else
                 {
-                    // fallback to double для int/long
-                    da = Convert.ToDouble(a);
-                    db = Convert.ToDouble(b);
+                    double da = Convert.ToDouble(a);
+                    double db = Convert.ToDouble(b);
                     switch (op)
                     {
                         case Code.Ceq: return da == db;
