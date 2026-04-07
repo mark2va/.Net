@@ -32,7 +32,7 @@ namespace Deobfuscator
                 {
                     foreach (var method in type.Methods)
                     {
-                        if (!method.HasBody || !method.Body.IsIL) continue;
+                        if (!method.HasBody || !method.Body.HasInstructions) continue;
 
                         var body = method.Body;
                         var instrs = body.Instructions;

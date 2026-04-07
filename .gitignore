@@ -1,56 +1,64 @@
 ```
-# Build artifacts
-bin/
-obj/
-*.dll
+# Compiled and binary files
 *.exe
-*.pdb
+*.dll
 *.so
-*.dylib
-*.jar
-*.war
-*.class
 *.o
 *.obj
 *.out
-*.a
-*.lib
+*.class
+*.pyc
+__pycache__/
 
 # Dependencies
-packages/
 node_modules/
-vendor/
-
-# IDE files
-.vs/
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Logs
-*.log
-
-# Environment
+venv/
+.venv/
 .env
 .env.local
 .env.*
 
-# OS generated files
-.DS_Store
-Thumbs.db
+# Build artifacts
+dist/
+build/
+target/
+*.tmp
 
-# Test and coverage
+# Logs
+*.log
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Coverage
 coverage/
 htmlcov/
 .coverage
-*.cover
-coverage.xml
 
-# Temporary files
-*.tmp
-*.temp
-*~
-.DS_Store
+# Compression
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.lzh
+*.cab
+*.arj
+*.rpm
+*.deb
+*.Z
+*.lz
+*.lzo
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.zst
 ```
