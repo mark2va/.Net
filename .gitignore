@@ -1,1 +1,47 @@
-Nothing should be ignored based on the provided file changes. The listed files are all C# source code files (.cs) which are core project files and should be tracked in version control. There are no build artifacts, dependency directories, temporary files, or other items that need to be ignored.
+```
+# Compiled and build artifacts
+*.exe
+*.dll
+*.so
+*.a
+*.obj
+*.out
+obj/
+bin/
+Debug/
+Release/
+
+# Dependencies
+packages/
+node_modules/
+venv/
+.venv/
+__pycache__/
+*.egg-info/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+*.userprefs
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Build outputs
+dist/
+build/
+target/
+out/
+_output/
+```
