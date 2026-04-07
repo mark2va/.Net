@@ -623,6 +623,21 @@ namespace Deobfuscator
 
             if (wrappers.Count > 0)
             {
+                // Обнаружение циклических зависимостей
+                var cyclicMethods = DetectCyclicDependencies(wrappers);
+                
+                if (cyclicMethods.Count > 0)
+                {
+                    Log($"  Detected {cyclicMethods.Count} methods in cyclic dependencies, skipping them.");
+                    Console.WriteLine($"[!] Skipping {cyclicMethods.Count} methods involved in cyclic dependencies.");
+                    
+                    // Удаляем цикличные методы из списка wrapper'ов
+                    foreach (var cyclicMethod in cyclicMethods)
+                    {
+                        wrappers.Remove(cyclicMethod);
+                    }
+                }
+                
                 bool changed = true;
                 int maxIterations = 10;
                 int iteration = 0;
@@ -661,6 +676,74 @@ namespace Deobfuscator
             }
 
             Console.WriteLine($"[+] Inlined {inlinedCount} wrapper calls across {wrappers.Count} wrapper methods.");
+        }
+
+        /// <summary>
+        /// Обнаруживает методы, участвующие в циклических зависимостях.
+        /// </summary>
+        private HashSet<MethodDef> DetectCyclicDependencies(Dictionary<MethodDef, MethodDef> wrappers)
+        {
+            var cyclicMethods = new HashSet<MethodDef>();
+            
+            // Строим граф зависимостей: метод -> список методов, которые его используют
+            var usedBy = new Dictionary<MethodDef, List<MethodDef>>();
+            
+            foreach (var kvp in wrappers)
+            {
+                var wrapper = kvp.Key;
+                var target = kvp.Value;
+                
+                if (!usedBy.ContainsKey(target))
+                    usedBy[target] = new List<MethodDef>();
+                
+                usedBy[target].Add(wrapper);
+            }
+            
+            // Для каждого метода проверяем, есть ли цикл
+            foreach (var startMethod in wrappers.Keys)
+            {
+                var visited = new HashSet<MethodDef>();
+                var stack = new Stack<MethodDef>();
+                stack.Push(startMethod);
+                
+                while (stack.Count > 0)
+                {
+                    var current = stack.Pop();
+                    
+                    if (visited.Contains(current))
+                    {
+                        // Если мы встретили метод, который уже посещали в текущем обходе,
+                        // и это не начальный метод, проверяем дальше
+                        continue;
+                    }
+                    
+                    visited.Add(current);
+                    
+                    // Если текущий метод является wrapper'ом, получаем целевой метод
+                    if (wrappers.ContainsKey(current))
+                    {
+                        var target = wrappers[current];
+                        
+                        // Если целевой метод - это начальный метод, нашли цикл
+                        if (target == startMethod)
+                        {
+                            // Добавляем все методы из текущего пути в цикличные
+                            foreach (var m in visited)
+                                cyclicMethods.Add(m);
+                            cyclicMethods.Add(startMethod);
+                            break;
+                        }
+                        
+                        // Если еще не посещали целевой метод, добавляем в стек
+                        if (!visited.Contains(target))
+                        {
+                            stack.Push(target);
+                        }
+                    }
+                }
+            }
+            
+            return cyclicMethods;
         }
 
         private void CleanupAll()
