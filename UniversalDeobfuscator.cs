@@ -502,9 +502,11 @@ namespace Deobfuscator
 
             if (useAi)
             {
+                Console.Write("[*] Connecting to AI... ");
                 ai = new AiAssistant(_aiConfig, _debugMode);
                 if (!ai.IsConnected)
                 {
+                    Console.WriteLine("FAILED");
                     Console.WriteLine("[!] AI connection failed. Falling back to simple renaming.");
                     useAi = false;
                     ai.Dispose();
@@ -512,7 +514,7 @@ namespace Deobfuscator
                 }
                 else
                 {
-                    Console.WriteLine($"[+] AI Connected. Model: {_aiConfig.ModelName}");
+                    Console.WriteLine($"OK ({_aiConfig.ModelName})");
                 }
             }
 
@@ -521,60 +523,103 @@ namespace Deobfuscator
             int methodCounter = 1;
             int fieldCounter = 1;
             int paramCounter = 1;
+            int localVarCounter = 1;
 
+            // Сначала соберем все элементы для переименования, чтобы показать прогресс
+            var itemsToRename = new List<(string Type, object Item, string OldName)>();
+            
             foreach (var type in _module.GetTypes())
             {
-                // Переименование типов
                 if (IsObfuscatedName(type.Name))
-                {
-                    string newName = useAi && ai != null ? GenerateAiName(ai, type.Name, "Class", "") : $"Class_{classCounter++}";
-                    type.Name = newName;
-                    renamedCount++;
-                }
+                    itemsToRename.Add(("Class", type, type.Name));
 
                 foreach (var method in type.Methods)
                 {
                     if (method.Name == ".cctor" || method.Name == ".ctor") continue;
                     if (IsObfuscatedName(method.Name))
-                    {
-                        string snippet = GetMethodSnippet(method);
-                        string retType = method.ReturnType?.ToString() ?? "void";
-                        
-                        string newName = $"Method_{methodCounter++}";
-                        if (useAi && ai != null)
-                        {
-                            string aiName = ai.GetSuggestedName(method.Name, snippet, retType);
-                            if (!string.IsNullOrEmpty(aiName) && aiName != method.Name && IsValidIdentifier(aiName))
-                                newName = aiName;
-                        }
-                        
-                        method.Name = newName;
-                        renamedCount++;
-                    }
+                        itemsToRename.Add(("Method", method, method.Name));
                     
-                    // Переименование параметров методов
                     foreach (var param in method.Params)
                     {
                         if (!string.IsNullOrEmpty(param.Name) && IsObfuscatedName(param.Name))
+                            itemsToRename.Add(("Param", param, param.Name));
+                    }
+                    
+                    // Сбор локальных переменных для переименования
+                    if (method.HasBody && method.Body.HasVariables)
+                    {
+                        foreach (var local in method.Body.Variables)
                         {
-                            param.Name = $"param_{paramCounter++}";
-                            renamedCount++;
+                            if (!string.IsNullOrEmpty(local.Name) && IsObfuscatedName(local.Name))
+                                itemsToRename.Add(("Local", local, local.Name));
                         }
                     }
                 }
                 
-                // Переименование полей
                 foreach (var field in type.Fields)
                 {
                     if (IsObfuscatedName(field.Name))
-                    {
-                        field.Name = $"field_{fieldCounter++}";
-                        renamedCount++;
-                    }
+                        itemsToRename.Add(("Field", field, field.Name));
                 }
             }
 
-            Console.WriteLine($"[+] Renamed {renamedCount} items.");
+            int total = itemsToRename.Count;
+            int current = 0;
+            int lastProgress = -1;
+
+            // Обработка с прогресс-баром
+            foreach (var item in itemsToRename)
+            {
+                current++;
+                int progress = (int)((current * 100) / total);
+                
+                // Обновляем прогресс только если изменился на 5% или больше
+                if (progress % 5 == 0 && progress != lastProgress)
+                {
+                    lastProgress = progress;
+                    Console.Write($"\r[*] Renaming: [{new string('█', progress / 5)}{new string('░', 20 - progress / 5)}] {progress}% ({current}/{total})");
+                }
+
+                if (item.Type == "Class" && item.Item is TypeDef type)
+                {
+                    string newName = useAi && ai != null ? GenerateAiName(ai, item.OldName, "Class", "") : $"Class_{classCounter++}";
+                    type.Name = newName;
+                    renamedCount++;
+                }
+                else if (item.Type == "Method" && item.Item is MethodDef method)
+                {
+                    string snippet = GetMethodSnippet(method);
+                    string retType = method.ReturnType?.ToString() ?? "void";
+                    
+                    string newName = $"Method_{methodCounter++}";
+                    if (useAi && ai != null)
+                    {
+                        string aiName = ai.GetSuggestedName(item.OldName, snippet, retType);
+                        if (!string.IsNullOrEmpty(aiName) && aiName != item.OldName && IsValidIdentifier(aiName))
+                            newName = aiName;
+                    }
+                    
+                    method.Name = newName;
+                    renamedCount++;
+                }
+                else if (item.Type == "Param" && item.Item is ParamDef param)
+                {
+                    param.Name = $"param_{paramCounter++}";
+                    renamedCount++;
+                }
+                else if (item.Type == "Field" && item.Item is FieldDef field)
+                {
+                    field.Name = $"field_{fieldCounter++}";
+                    renamedCount++;
+                }
+                else if (item.Type == "Local" && item.Item is Local local)
+                {
+                    local.Name = $"var_{localVarCounter++}";
+                    renamedCount++;
+                }
+            }
+
+            Console.WriteLine($"\r[+] Renamed {renamedCount} items.{(useAi && ai != null ? " (AI-assisted)" : "")}          ");
             ai?.Dispose();
         }
 
