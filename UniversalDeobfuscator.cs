@@ -353,6 +353,14 @@ namespace Deobfuscator
                     if (branchInstr.OpCode.Code == Code.Brtrue_S || branchInstr.OpCode.Code == Code.Brfalse_S)
                          branchInstr.OpCode = OpCodes.Br_S;
                     else branchInstr.OpCode = OpCodes.Br;
+                    
+                    // Очищаем инструкции условия (ldloc, ldc, ceq) - они больше не нужны
+                    instrs[ldlocIp].OpCode = OpCodes.Nop;
+                    instrs[ldlocIp].Operand = null;
+                    instrs[ldcIp].OpCode = OpCodes.Nop;
+                    instrs[ldcIp].Operand = null;
+                    instrs[cmpIp].OpCode = OpCodes.Nop;
+                    instrs[cmpIp].Operand = null;
                 }
                 else
                 {
@@ -360,6 +368,14 @@ namespace Deobfuscator
                     Log($"    Resolved branch at {branchIp}: FALSE -> nop");
                     branchInstr.OpCode = OpCodes.Nop;
                     branchInstr.Operand = null;
+                    
+                    // Очищаем инструкции условия (ldloc, ldc, ceq) - они больше не нужны
+                    instrs[ldlocIp].OpCode = OpCodes.Nop;
+                    instrs[ldlocIp].Operand = null;
+                    instrs[ldcIp].OpCode = OpCodes.Nop;
+                    instrs[ldcIp].Operand = null;
+                    instrs[cmpIp].OpCode = OpCodes.Nop;
+                    instrs[cmpIp].Operand = null;
                 }
                 return true;
             }
@@ -548,10 +564,23 @@ namespace Deobfuscator
         private bool IsObfuscatedName(string name)
         {
             if (string.IsNullOrEmpty(name)) return false;
-            if (name.StartsWith("<")) return false; 
+            if (name.StartsWith("<")) return false; // Сгенерированные компилятором (свойства, лямбды)
+            
+            // Если имя содержит символы вне диапазона ASCII (латиница, цифры, _), это признак обфускации
+            // Особенно актуально для случаев с арабскими/персидскими символами и прочими Unicode-знаками
+            foreach (char c in name)
+            {
+                if (c > 127) return true; // Любой символ с кодом > 127 считаем подозрительным
+                if (c == '_' || char.IsDigit(c)) continue;
+                if (!char.IsLetter(c)) return true; // Странные символы в ASCII диапазоне
+            }
+
+            // Короткие имена из 1-2 букв (a, b, aa, a1) тоже часто признак обфускации
             if (name.Length <= 2 && name.All(char.IsLetter)) return true;
+            
+            // Паттерны типа a1, b99
             if (System.Text.RegularExpressions.Regex.IsMatch(name, @"^[a-z]{1,2}\d+$")) return true;
-            if (name.Any(c => !char.IsLetterOrDigit(c) && c != '_' && c != '.')) return true; // Странные символы
+            
             return false;
         }
 
