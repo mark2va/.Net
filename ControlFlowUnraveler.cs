@@ -361,9 +361,11 @@ namespace Deobfuscator
                     case Code.Cgt: return da > db;
                     case Code.Clt: return da < db;
                     case Code.Cgt_Un:
-                    case Code.Cge_Un: return da > db;
+                    case Code.Cge_Un:
+                        return da > db;
                     case Code.Clt_Un:
-                    case Code.Cle_Un: return da < db;
+                    case Code.Cle_Un:
+                        return da < db;
                     default: return null;
                 }
             }
