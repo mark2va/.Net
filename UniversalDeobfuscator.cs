@@ -60,7 +60,7 @@ namespace Deobfuscator
             {
                 foreach (var method in type.Methods)
                 {
-                    if (!method.HasBody || !method.Body.IsIL) continue;
+                    if (!method.HasBody || !method.Body.HasInstructions) continue;
                     if (method.Body.Instructions.Count < 5) continue;
 
                     try
@@ -266,7 +266,7 @@ namespace Deobfuscator
                     int nextIp = ip + 1;
                     if (nextIp < instructions.Count) queue.Enqueue(Tuple.Create(nextIp, currentState));
                 }
-                else if (instr.OpCode.FlowControl == FlowControl.Ret || instr.OpCode.FlowControl == FlowControl.Throw)
+                else if (instr.OpCode.FlowControl == FlowControl.Return || instr.OpCode.FlowControl == FlowControl.Throw)
                 {
                     // Конец пути
                 }
@@ -384,7 +384,7 @@ namespace Deobfuscator
             {
                 foreach (var method in type.Methods)
                 {
-                    if (!method.HasBody || !method.Body.IsIL) continue;
+                    if (!method.HasBody || !method.Body.HasInstructions) continue;
 
                     var body = method.Body;
                     var instrs = body.Instructions;
@@ -564,7 +564,7 @@ namespace Deobfuscator
             {
                 foreach (var method in type.Methods)
                 {
-                    if (!method.HasBody || !method.Body.IsIL) continue;
+                    if (!method.HasBody || !method.Body.HasInstructions) continue;
                     if (method.Body.Instructions.Count > 10) continue;
 
                     var instrs = method.Body.Instructions;
@@ -661,7 +661,7 @@ namespace Deobfuscator
                     {
                         foreach (var method in type.Methods)
                         {
-                            if (!method.HasBody || !method.Body.IsIL) continue;
+                            if (!method.HasBody || !method.Body.HasInstructions) continue;
 
                             var instrs = method.Body.Instructions;
                             for (int i = 0; i < instrs.Count; i++)
@@ -818,7 +818,7 @@ namespace Deobfuscator
                 if (idx == -1) continue;
 
                 if (curr.OpCode.FlowControl != FlowControl.Branch && 
-                    curr.OpCode.FlowControl != FlowControl.Ret && 
+                    curr.OpCode.FlowControl != FlowControl.Return && 
                     curr.OpCode.FlowControl != FlowControl.Throw)
                 {
                     if (idx + 1 < body.Instructions.Count)
