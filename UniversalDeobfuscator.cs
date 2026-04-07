@@ -502,7 +502,7 @@ namespace Deobfuscator
 
             if (useAi)
             {
-                ai = new AiAssistant(_aiConfig);
+                ai = new AiAssistant(_aiConfig, _debugMode);
                 if (!ai.IsConnected)
                 {
                     Console.WriteLine("[!] AI connection failed. Falling back to simple renaming.");
@@ -519,6 +519,8 @@ namespace Deobfuscator
             int renamedCount = 0;
             int classCounter = 1;
             int methodCounter = 1;
+            int fieldCounter = 1;
+            int paramCounter = 1;
 
             foreach (var type in _module.GetTypes())
             {
@@ -547,6 +549,26 @@ namespace Deobfuscator
                         }
                         
                         method.Name = newName;
+                        renamedCount++;
+                    }
+                    
+                    // Переименование параметров методов
+                    foreach (var param in method.Params)
+                    {
+                        if (!string.IsNullOrEmpty(param.Name) && IsObfuscatedName(param.Name))
+                        {
+                            param.Name = $"param_{paramCounter++}";
+                            renamedCount++;
+                        }
+                    }
+                }
+                
+                // Переименование полей
+                foreach (var field in type.Fields)
+                {
+                    if (IsObfuscatedName(field.Name))
+                    {
+                        field.Name = $"field_{fieldCounter++}";
                         renamedCount++;
                     }
                 }
@@ -668,6 +690,16 @@ namespace Deobfuscator
             if (a == null || b == null) return null;
             try
             {
+                // Поддержка long (Int64)
+                if (a is long la && b is long lb)
+                {
+                    switch (op)
+                    {
+                        case Code.Ceq: return la == lb;
+                        case Code.Cgt: case Code.Cgt_Un: return la > lb;
+                        case Code.Clt: case Code.Clt_Un: return la < lb;
+                    }
+                }
                 // Поддержка double и float
                 if (a is double da && b is double db)
                 {

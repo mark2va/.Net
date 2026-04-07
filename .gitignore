@@ -1,40 +1,4 @@
-```
-# Compiled and build artifacts
-*.csproj.user
-*.userprefs
-*.suo
-*.user
-*.aps
-*.ncb
-*.obj
-*.exe
-*.dll
-*.pdb
-*.ilk
-*.lib
-*.exp
-*.iobj
-*.ipdb
-*.tlog
-*.log
-*.tmp
-
-# Dependencies
-packages/
-node_modules/
-bin/
-obj/
-
-# Environment specific
-.vs/
-.vshistory/
-TestResults/
-
-# User-specific
-*.user
-*.userosscache
-*.sln.docstates
-
+```csharp
 # Build results
 [Dd]ebug/
 [Dd]ebugPublic/
@@ -42,12 +6,57 @@ TestResults/
 [Rr]eleases/
 x64/
 x86/
-build/
-bld/
-[Bb]in/
-[Oo]bj/
+[Dd]epends/
+[Mm]onoAndroid/
+[Mm]onoTouch/
+[Xx]amarin/
+bin/
+obj/
 
-# Visual Studio cache/options
+# User-specific files
+*.user
+*.userosscache
+*.suo
+*.userprefs
+*.pidb
+*.log
+*.vcxproj.filters
 *.VC.db
 *.VC.VC.opendb
+
+# Build cache
+.nuget/
+packages/
+_resharper*/
+*.[Ss]uo
+*.userprefs
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Testing
+TestResults/
+*.trx
+
+# IDE
+.vs/
+.idea/
+*.swp
+*.swo
+*.tmp
+
+# Logs
+*.log
 ```
