@@ -1,44 +1,53 @@
 ```
-# Build artifacts
+# Compiled and build artifacts
+*.csproj.user
+*.userprefs
+*.suo
+*.user
+*.aps
+*.ncb
+*.obj
 *.exe
 *.dll
 *.pdb
-*.obj
+*.ilk
 *.lib
-*.so
-*.dylib
+*.exp
+*.iobj
+*.ipdb
+*.tlog
+*.log
+*.tmp
 
 # Dependencies
 packages/
+node_modules/
 bin/
 obj/
-Debug/
-Release/
 
-# Logs
-*.log
+# Environment specific
+.vs/
+.vshistory/
+TestResults/
 
-# Environment
-.env
-.env.local
-*.env.*
+# User-specific
+*.user
+*.userosscache
+*.sln.docstates
 
-# Editors
-.vscode/
-.idea/
-*.swp
-*.swo
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+build/
+bld/
+[Bb]in/
+[Oo]bj/
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Coverage
-coverage/
-htmlcov/
-*.coverage
-
-# Temporary files
-*.tmp
-*.temp
+# Visual Studio cache/options
+*.VC.db
+*.VC.VC.opendb
 ```
