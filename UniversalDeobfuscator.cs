@@ -16,6 +16,7 @@ namespace Deobfuscator
         private ControlFlowUnraveler? _cfUnraveler;
         private MathOptimizer? _mathOptimizer;
         private WrapperInliner? _wrapperInliner;
+        private CallChainAnalyzer? _callChainAnalyzer;
         private Renamer? _renamer;
 
         public UniversalDeobfuscator(string filePath, AiConfig aiConfig, bool debugMode = false)
@@ -37,6 +38,7 @@ namespace Deobfuscator
             _cfUnraveler = new ControlFlowUnraveler(debugMode ? Log : null);
             _mathOptimizer = new MathOptimizer(debugMode ? Log : null);
             _wrapperInliner = new WrapperInliner(debugMode ? Log : null);
+            _callChainAnalyzer = new CallChainAnalyzer(debugMode ? Log : null);
             _renamer = new Renamer(aiConfig, debugMode ? Log : null);
         }
 
@@ -90,11 +92,38 @@ namespace Deobfuscator
             Console.WriteLine("[*] Cleaning up dead code...");
             CleanupAll();
 
-            Log("Phase 4: Inlining Trivial Wrappers");
+            Log("Phase 4: Analyzing Call Chains");
+            Console.WriteLine("[*] Analyzing method call chains...");
+            var callChains = _callChainAnalyzer!.ScanModule(_module);
+            
+            if (callChains.Count > 0)
+            {
+                Console.WriteLine($"[+] Found {callChains.Count} call chains.");
+                
+                // Генерируем отчет для dnSpy
+                string report = _callChainAnalyzer.GenerateReport(callChains);
+                if (_debugMode)
+                {
+                    string reportPath = Path.Combine(Path.GetDirectoryName(_module.Location) ?? Directory.GetCurrentDirectory(), "call_chains_report.txt");
+                    File.WriteAllText(reportPath, report);
+                    Log($"Call chains report saved to: {reportPath}");
+                }
+                
+                // Применяем инлайн к цепочкам, которые можно безопасно сократить
+                var inlineableChains = callChains.Where(c => c.CanInline).ToList();
+                if (inlineableChains.Count > 0)
+                {
+                    Console.WriteLine($"[*] Applying inlining for {inlineableChains.Count} safe chains...");
+                    int chainInlinedCount = _callChainAnalyzer.ApplyInlining(_module, inlineableChains);
+                    Console.WriteLine($"[+] Inlined {chainInlinedCount} calls from chains.");
+                }
+            }
+
+            Log("Phase 5: Inlining Trivial Wrappers");
             Console.WriteLine("[*] Inlining trivial wrapper methods...");
             int inlinedCount = _wrapperInliner!.Inline(_module);
 
-            Log("Phase 5: Renaming");
+            Log("Phase 6: Renaming");
             Console.WriteLine("[*] Renaming obfuscated items...");
             _renamer!.Rename(_module);
 
