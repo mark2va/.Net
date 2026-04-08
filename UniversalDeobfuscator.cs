@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using dnlib.DotNet;
 using dnlib.DotNet.Writer;
 using dnlib.DotNet.Emit;
+using System.Linq;
 
 namespace Deobfuscator
 {
@@ -54,7 +55,7 @@ namespace Deobfuscator
         {
             Log("Phase 1: Control Flow Unpacking (State Machine)");
             Console.WriteLine("[*] Analyzing and unraveling control flow...");
-            
+
             int unraveledCount = 0;
             int failedCount = 0;
 
@@ -95,11 +96,11 @@ namespace Deobfuscator
             Log("Phase 4: Analyzing Call Chains");
             Console.WriteLine("[*] Analyzing method call chains...");
             var callChains = _callChainAnalyzer!.ScanModule(_module);
-            
+
             if (callChains.Count > 0)
             {
                 Console.WriteLine($"[+] Found {callChains.Count} call chains.");
-                
+
                 // Генерируем отчет для dnSpy
                 string report = _callChainAnalyzer.GenerateReport(callChains);
                 if (_debugMode)
@@ -108,7 +109,7 @@ namespace Deobfuscator
                     File.WriteAllText(reportPath, report);
                     Log($"Call chains report saved to: {reportPath}");
                 }
-                
+
                 // Применяем инлайн к цепочкам, которые можно безопасно сократить
                 var inlineableChains = callChains.Where(c => c.CanInline).ToList();
                 if (inlineableChains.Count > 0)
@@ -137,10 +138,10 @@ namespace Deobfuscator
         {
             var body = method.Body;
             var instrs = body.Instructions;
-            
+
             // 1. Поиск переменной состояния (State Variable)
             int? stateVarIndex = FindStateVariable(method);
-            
+
             if (!stateVarIndex.HasValue)
             {
                 return SimplifyControlFlowBasic(method);
@@ -213,7 +214,7 @@ namespace Deobfuscator
                     var next = instructions[i + 1];
                     var next2 = instructions[i + 2];
 
-                    if (IsLdc(next) && 
+                    if (IsLdc(next) &&
                         (next2.OpCode.Code == Code.Ceq || next2.OpCode.Code == Code.Cgt || next2.OpCode.Code == Code.Clt || next2.OpCode.Code == Code.Cgt_Un || next2.OpCode.Code == Code.Clt_Un))
                     {
                         if (!usageCount.ContainsKey(idx)) usageCount[idx] = 0;
@@ -237,9 +238,9 @@ namespace Deobfuscator
         {
             var stateValues = new Dictionary<int, object?>();
             var instructions = method.Body.Instructions;
-            
+
             var queue = new Queue<Tuple<int, object?>>();
-            
+
             object? initialState = null;
             int startIp = 0;
 
@@ -259,7 +260,7 @@ namespace Deobfuscator
             if (initialState == null) return stateValues;
 
             queue.Enqueue(Tuple.Create(startIp, initialState));
-            
+
             var visited = new HashSet<int>();
 
             while (queue.Count > 0)
@@ -302,7 +303,7 @@ namespace Deobfuscator
                 else
                 {
                     object? nextState = currentState;
-                    
+
                     if (IsStloc(instr, out int sIdx) && sIdx == stateVarIndex)
                     {
                         if (ip > 0 && IsLdc(instructions[ip - 1]))
@@ -310,7 +311,7 @@ namespace Deobfuscator
                             nextState = GetConstantValue(instructions[ip - 1]);
                         }
                     }
-                    
+
                     int nextIp = ip + 1;
                     if (nextIp < instructions.Count)
                     {
@@ -328,7 +329,7 @@ namespace Deobfuscator
         private bool TryResolveBranch(IList<Instruction> instrs, int branchIp, Dictionary<int, object?> stateMap, int stateVarIndex)
         {
             var branchInstr = instrs[branchIp];
-            
+
             int lookback = 0;
             int cmpIp = -1;
             int ldcIp = -1;
@@ -340,7 +341,7 @@ namespace Deobfuscator
                 var i2 = instrs[branchIp - 2];
                 var i3 = instrs[branchIp - 3];
 
-                if ((i1.OpCode.Code == Code.Ceq || i1.OpCode.Code == Code.Cgt || i1.OpCode.Code == Code.Clt || 
+                if ((i1.OpCode.Code == Code.Ceq || i1.OpCode.Code == Code.Cgt || i1.OpCode.Code == Code.Clt ||
                      i1.OpCode.Code == Code.Cgt_Un || i1.OpCode.Code == Code.Clt_Un) &&
                     IsLdc(i2) && IsLdloc(i3, out int lIdx) && lIdx == stateVarIndex)
                 {
@@ -368,9 +369,9 @@ namespace Deobfuscator
                     Log($"    Resolved branch at {branchIp}: TRUE -> br");
                     branchInstr.OpCode = OpCodes.Br;
                     if (branchInstr.OpCode.Code == Code.Brtrue_S || branchInstr.OpCode.Code == Code.Brfalse_S)
-                         branchInstr.OpCode = OpCodes.Br_S;
+                        branchInstr.OpCode = OpCodes.Br_S;
                     else branchInstr.OpCode = OpCodes.Br;
-                    
+
                     instrs[ldlocIp].OpCode = OpCodes.Nop;
                     instrs[ldlocIp].Operand = null;
                     instrs[ldcIp].OpCode = OpCodes.Nop;
@@ -383,7 +384,7 @@ namespace Deobfuscator
                     Log($"    Resolved branch at {branchIp}: FALSE -> nop");
                     branchInstr.OpCode = OpCodes.Nop;
                     branchInstr.Operand = null;
-                    
+
                     instrs[ldlocIp].OpCode = OpCodes.Nop;
                     instrs[ldlocIp].Operand = null;
                     instrs[ldcIp].OpCode = OpCodes.Nop;
@@ -454,10 +455,10 @@ namespace Deobfuscator
                                                 if (i + 3 < instrs.Count && IsConversionToInt(next2))
                                                 {
                                                     int finalResult = Convert.ToInt32(result);
-                                                    
+
                                                     instr.OpCode = OpCodes.Ldc_I4;
                                                     instr.Operand = finalResult;
-                                                    
+
                                                     next1.OpCode = OpCodes.Nop;
                                                     next1.Operand = null;
                                                     next2.OpCode = OpCodes.Nop;
@@ -490,7 +491,7 @@ namespace Deobfuscator
                             }
 
                             // Арифметические операции с константами
-                            if ((instr.OpCode.Code == Code.Add || instr.OpCode.Code == Code.Sub || 
+                            if ((instr.OpCode.Code == Code.Add || instr.OpCode.Code == Code.Sub ||
                                  instr.OpCode.Code == Code.Mul || instr.OpCode.Code == Code.Div) && i >= 2)
                             {
                                 var prev1 = instrs[i - 1];
@@ -515,7 +516,7 @@ namespace Deobfuscator
                                                 else if (instr.OpCode.Code == Code.Mul) result = i1 * i2;
                                                 else if (instr.OpCode.Code == Code.Div && i2 != 0) result = i1 / i2;
                                             }
-                                            else if ((val1 is long l1 && val2 is long l2) || 
+                                            else if ((val1 is long l1 && val2 is long l2) ||
                                                      (val1 is int i1l && val2 is long l2l))
                                             {
                                                 long vl1 = Convert.ToInt64(val1);
@@ -540,13 +541,13 @@ namespace Deobfuscator
 
                                             if (result != null)
                                             {
-                                                prev2.OpCode = resultCode == Code.Ldc_I8 ? OpCodes.Ldc_I8 : 
+                                                prev2.OpCode = resultCode == Code.Ldc_I8 ? OpCodes.Ldc_I8 :
                                                                resultCode == Code.Ldc_R8 ? OpCodes.Ldc_R8 : OpCodes.Ldc_I4;
                                                 prev2.Operand = result;
-                                                
+
                                                 prev1.OpCode = OpCodes.Nop;
                                                 prev1.Operand = null;
-                                                
+
                                                 instr.OpCode = OpCodes.Nop;
                                                 instr.Operand = null;
 
@@ -577,7 +578,7 @@ namespace Deobfuscator
         {
             return instr.OpCode.Code == Code.Conv_I4 || instr.OpCode.Code == Code.Conv_I ||
                    instr.OpCode.Code == Code.Conv_Ovf_I4 || instr.OpCode.Code == Code.Conv_Ovf_I4_Un ||
-                   instr.OpCode.Code == Code.Stelem_I4 || instr.OpCode.Code == Code.Box && 
+                   instr.OpCode.Code == Code.Stelem_I4 || instr.OpCode.Code == Code.Box &&
                    instr.Operand is TypeDef td && td.FullName == "System.Int32";
         }
 
@@ -597,7 +598,7 @@ namespace Deobfuscator
                     if (method.Body.Instructions.Count > 10) continue;
 
                     var instrs = method.Body.Instructions;
-                    
+
                     int callIndex = -1;
                     IMethodDefOrRef? targetMethod = null;
 
@@ -629,13 +630,13 @@ namespace Deobfuscator
                                 break;
                             }
                         }
-                        
+
                         if (isWrapper)
                         {
                             for (int i = 0; i < callIndex; i++)
                             {
                                 var code = instrs[i].OpCode.Code;
-                                if (code != Code.Ldarg && code != Code.Ldarg_0 && code != Code.Ldarg_1 && 
+                                if (code != Code.Ldarg && code != Code.Ldarg_0 && code != Code.Ldarg_1 &&
                                     code != Code.Ldarg_2 && code != Code.Ldarg_3 && code != Code.Ldarg_S &&
                                     code != Code.Nop && code != Code.Stloc && code != Code.Stloc_S &&
                                     code != Code.Ldloc && code != Code.Ldloc_S && code != Code.Ldloc_0 &&
@@ -650,7 +651,7 @@ namespace Deobfuscator
 
                     if (isWrapper && targetMethod != null)
                     {
-                        var targetDef = targetMethod.ResolveToken();
+                        var targetDef = targetMethod.ResolveMethodDef();
                         if (targetDef is MethodDef targetMethodDef && targetMethodDef != method)
                         {
                             wrappers[method] = targetMethodDef;
@@ -664,19 +665,19 @@ namespace Deobfuscator
             {
                 // Обнаружение циклических зависимостей
                 var cyclicMethods = DetectCyclicDependencies(wrappers);
-                
+
                 if (cyclicMethods.Count > 0)
                 {
                     Log($"  Detected {cyclicMethods.Count} methods in cyclic dependencies, skipping them.");
                     Console.WriteLine($"[!] Skipping {cyclicMethods.Count} methods involved in cyclic dependencies.");
-                    
+
                     // Удаляем цикличные методы из списка wrapper'ов
                     foreach (var cyclicMethod in cyclicMethods)
                     {
                         wrappers.Remove(cyclicMethod);
                     }
                 }
-                
+
                 bool changed = true;
                 int maxIterations = 10;
                 int iteration = 0;
@@ -698,7 +699,7 @@ namespace Deobfuscator
                                 if ((instrs[i].OpCode.Code == Code.Call || instrs[i].OpCode.Code == Code.Callvirt) &&
                                     instrs[i].Operand is IMethodDefOrRef calledMethod)
                                 {
-                                    var calledDef = calledMethod.ResolveToken();
+                                    var calledDef = calledMethod.ResolveMethodDef();
                                     if (calledDef is MethodDef calledMethodDef && wrappers.ContainsKey(calledMethodDef))
                                     {
                                         var target = wrappers[calledMethodDef];
@@ -723,46 +724,46 @@ namespace Deobfuscator
         private HashSet<MethodDef> DetectCyclicDependencies(Dictionary<MethodDef, MethodDef> wrappers)
         {
             var cyclicMethods = new HashSet<MethodDef>();
-            
+
             // Строим граф зависимостей: метод -> список методов, которые его используют
             var usedBy = new Dictionary<MethodDef, List<MethodDef>>();
-            
+
             foreach (var kvp in wrappers)
             {
                 var wrapper = kvp.Key;
                 var target = kvp.Value;
-                
+
                 if (!usedBy.ContainsKey(target))
                     usedBy[target] = new List<MethodDef>();
-                
+
                 usedBy[target].Add(wrapper);
             }
-            
+
             // Для каждого метода проверяем, есть ли цикл
             foreach (var startMethod in wrappers.Keys)
             {
                 var visited = new HashSet<MethodDef>();
                 var stack = new Stack<MethodDef>();
                 stack.Push(startMethod);
-                
+
                 while (stack.Count > 0)
                 {
                     var current = stack.Pop();
-                    
+
                     if (visited.Contains(current))
                     {
                         // Если мы встретили метод, который уже посещали в текущем обходе,
                         // и это не начальный метод, проверяем дальше
                         continue;
                     }
-                    
+
                     visited.Add(current);
-                    
+
                     // Если текущий метод является wrapper'ом, получаем целевой метод
                     if (wrappers.ContainsKey(current))
                     {
                         var target = wrappers[current];
-                        
+
                         // Если целевой метод - это начальный метод, нашли цикл
                         if (target == startMethod)
                         {
@@ -772,7 +773,7 @@ namespace Deobfuscator
                             cyclicMethods.Add(startMethod);
                             break;
                         }
-                        
+
                         // Если еще не посещали целевой метод, добавляем в стек
                         if (!visited.Contains(target))
                         {
@@ -781,7 +782,7 @@ namespace Deobfuscator
                     }
                 }
             }
-            
+
             return cyclicMethods;
         }
 
@@ -818,7 +819,7 @@ namespace Deobfuscator
                             if (ins.Operand == body.Instructions[i]) { isTarget = true; break; }
                             if (ins.Operand is Instruction[] arr && Array.IndexOf(arr, body.Instructions[i]) >= 0) { isTarget = true; break; }
                         }
-                        
+
                         if (!isTarget)
                         {
                             body.Instructions.RemoveAt(i);
@@ -846,8 +847,8 @@ namespace Deobfuscator
                 int idx = body.Instructions.IndexOf(curr);
                 if (idx == -1) continue;
 
-                if (curr.OpCode.FlowControl != FlowControl.Branch && 
-                    curr.OpCode.FlowControl != FlowControl.Return && 
+                if (curr.OpCode.FlowControl != FlowControl.Branch &&
+                    curr.OpCode.FlowControl != FlowControl.Return &&
                     curr.OpCode.FlowControl != FlowControl.Throw)
                 {
                     if (idx + 1 < body.Instructions.Count)
@@ -877,7 +878,7 @@ namespace Deobfuscator
                     changed = true;
                 }
             }
-            
+
             if (changed) CleanupNops(method);
         }
 
@@ -914,7 +915,7 @@ namespace Deobfuscator
             int localVarCounter = 1;
 
             var itemsToRename = new List<(string Type, object Item, string OldName)>();
-            
+
             foreach (var type in _module.GetTypes())
             {
                 if (IsObfuscatedName(type.Name))
@@ -925,13 +926,13 @@ namespace Deobfuscator
                     if (method.Name == ".cctor" || method.Name == ".ctor") continue;
                     if (IsObfuscatedName(method.Name))
                         itemsToRename.Add(("Method", method, method.Name));
-                    
-                    foreach (var param in method.Params)
+
+                    foreach (var param in method.Parameters)
                     {
                         if (!string.IsNullOrEmpty(param.Name) && IsObfuscatedName(param.Name))
                             itemsToRename.Add(("Param", param, param.Name));
                     }
-                    
+
                     if (method.HasBody && method.Body.HasVariables)
                     {
                         foreach (var local in method.Body.Variables)
@@ -941,7 +942,7 @@ namespace Deobfuscator
                         }
                     }
                 }
-                
+
                 foreach (var field in type.Fields)
                 {
                     if (IsObfuscatedName(field.Name))
@@ -957,7 +958,7 @@ namespace Deobfuscator
             {
                 current++;
                 int progress = (int)((current * 100) / total);
-                
+
                 if (progress % 5 == 0 && progress != lastProgress)
                 {
                     lastProgress = progress;
@@ -974,7 +975,7 @@ namespace Deobfuscator
                 {
                     string snippet = GetMethodSnippet(method);
                     string retType = method.ReturnType?.ToString() ?? "void";
-                    
+
                     string newName = $"Method_{methodCounter++}";
                     if (useAi && ai != null)
                     {
@@ -982,7 +983,7 @@ namespace Deobfuscator
                         if (!string.IsNullOrEmpty(aiName) && aiName != item.OldName && IsValidIdentifier(aiName))
                             newName = aiName;
                     }
-                    
+
                     method.Name = newName;
                     renamedCount++;
                 }
@@ -1016,7 +1017,7 @@ namespace Deobfuscator
         {
             if (string.IsNullOrEmpty(name)) return false;
             if (name.StartsWith("<")) return false;
-            
+
             foreach (char c in name)
             {
                 if (c > 127) return true;
@@ -1025,9 +1026,9 @@ namespace Deobfuscator
             }
 
             if (name.Length <= 2 && name.All(char.IsLetter)) return true;
-            
+
             if (System.Text.RegularExpressions.Regex.IsMatch(name, @"^[a-z]{1,2}\d+$")) return true;
-            
+
             return false;
         }
 
@@ -1132,9 +1133,8 @@ namespace Deobfuscator
                     case Code.Cgt: return da > db;
                     case Code.Clt: return da < db;
                     case Code.Cgt_Un:
-                    case Code.Cge_Un: return da > db;
                     case Code.Clt_Un:
-                    case Code.Cle_Un: return da < db;
+
                     default: return null;
                 }
             }
@@ -1151,14 +1151,14 @@ namespace Deobfuscator
         {
             Console.WriteLine($"[*] Saving to: {path}");
             Log($"Saving to: {path}");
-            
+
             var opts = new ModuleWriterOptions(_module)
             {
                 Logger = DummyLogger.NoThrowInstance,
                 MetadataOptions = new MetadataOptions { Flags = MetadataFlags.KeepOldMaxStack }
             };
             _module.Write(path, opts);
-            
+
             Console.WriteLine("[+] Done.");
             Log("Saved successfully.");
         }
