@@ -63,7 +63,7 @@ namespace Deobfuscator
             {
                 foreach (var method in type.Methods)
                 {
-                    if (method.HasBody && method.Body.IsIL && method.Body.Instructions.Count > 0)
+                    if (method.HasBody && method.Body.HasInstructions && method.Body.Instructions.Count > 0)
                     {
                         allMethods.Add(method);
                     }
@@ -102,7 +102,7 @@ namespace Deobfuscator
         /// </summary>
         private CallChainResult? AnalyzeCallChain(MethodDef startMethod, List<MethodDef> allMethods)
         {
-            if (!startMethod.HasBody || !startMethod.Body.IsIL)
+            if (!startMethod.HasBody || !startMethod.Body.HasInstructions)
                 return null;
 
             var result = new CallChainResult
@@ -147,7 +147,7 @@ namespace Deobfuscator
                 // Если метод вызывает другой метод, добавляем его в цепочку
                 if (executionResult.CalledMethod != null)
                 {
-                    var calledDef = executionResult.CalledMethod.ResolveToken();
+                    var calledDef = executionResult.CalledMethod.ResolveMethodDef();
                     
                     if (calledDef is MethodDef calledMethodDef)
                     {
@@ -204,7 +204,7 @@ namespace Deobfuscator
         /// </summary>
         private ExecutionResult? VirtualExecuteMethod(MethodDef method, VirtualState initialState, List<MethodDef> allMethods)
         {
-            if (!method.HasBody || !method.Body.IsIL)
+            if (!method.HasBody || !method.Body.HasInstructions)
                 return null;
 
             var instructions = method.Body.Instructions;
@@ -550,18 +550,40 @@ namespace Deobfuscator
         private object? GetDefaultValue(TypeSig type)
         {
             if (type == null) return null;
-            
+
             if (type.IsValueType)
             {
-                if (type.IsInteger || type.IsPrimitive)
+                // Проверка на целые числа и примитивы
+                if (type.IsPrimitive || IsIntegerType(type.ElementType))
                     return 0;
-                if (type.IsFloat)
+
+                // Проверка на числа с плавающей точкой (float/double)
+                if (type.ElementType == ElementType.R4 || type.ElementType == ElementType.R8)
                     return 0.0;
-                if (type.FullName == "System.Boolean")
+
+                // Проверка на Boolean
+                if (type.ElementType == ElementType.Boolean)
                     return false;
+
+                // Для всех остальных значимых типов (struct, enum и т.д.)
+                return null;
             }
-            
+
             return null;
+        }
+
+        // Вспомогательный метод для проверки целочисленных типов
+        private bool IsIntegerType(ElementType et)
+        {
+            return et switch
+            {
+                ElementType.I1 or ElementType.U1 or
+                ElementType.I2 or ElementType.U2 or
+                ElementType.I4 or ElementType.U4 or
+                ElementType.I8 or ElementType.U8 or
+                ElementType.I or ElementType.U => true,
+                _ => false
+            };
         }
 
         private int GetArgumentIndex(Instruction instr)
@@ -806,7 +828,7 @@ namespace Deobfuscator
         /// </summary>
         private bool IsValidForInlining(MethodDef method)
         {
-            if (!method.HasBody || !method.Body.IsIL)
+            if (!method.HasBody || !method.Body.HasInstructions)
                 return false;
 
             if (method.Body.Instructions.Count > _maxInstructionsPerMethod)
@@ -853,7 +875,7 @@ namespace Deobfuscator
         /// </summary>
         private bool IsStackBalanced(MethodDef method)
         {
-            if (!method.HasBody || !method.Body.IsIL)
+            if (!method.HasBody || !method.Body.HasInstructions)
                 return false;
 
             var instructions = method.Body.Instructions;
@@ -915,7 +937,7 @@ namespace Deobfuscator
                 {
                     foreach (var method in type.Methods)
                     {
-                        if (!method.HasBody || !method.Body.IsIL)
+                        if (!method.HasBody || !method.Body.HasInstructions)
                             continue;
 
                         var instrs = method.Body.Instructions;
@@ -925,7 +947,7 @@ namespace Deobfuscator
                             if ((instrs[i].OpCode.Code == Code.Call || instrs[i].OpCode.Code == Code.Callvirt) &&
                                 instrs[i].Operand is IMethodDefOrRef calledMethod)
                             {
-                                var calledDef = calledMethod.ResolveToken();
+                                var calledDef = calledMethod.ResolveMethodDef();
                                 
                                 // Если вызывается метод из цепочки
                                 if (calledDef == chain.StartMethod || chain.Chain.Contains(calledDef as MethodDef))

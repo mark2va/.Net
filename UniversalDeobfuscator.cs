@@ -65,7 +65,7 @@ namespace Deobfuscator
             // Phase 1: Control Flow Unpacking (State Machine)
             Log("Phase 1: Control Flow Unpacking (State Machine)");
             Console.WriteLine("[*] Analyzing and unraveling control flow...");
-            
+
             int unraveledCount = 0;
             int failedCount = 0;
 
@@ -113,7 +113,7 @@ namespace Deobfuscator
             if (callChains.Count > 0)
             {
                 Console.WriteLine($"[+] Found {callChains.Count} call chains.");
-                
+
                 // Генерируем отчет для dnSpy
                 string report = _callChainAnalyzer.GenerateReport(callChains);
                 if (_debugMode)
@@ -122,7 +122,7 @@ namespace Deobfuscator
                     File.WriteAllText(reportPath, report);
                     Log($"Call chains report saved to: {reportPath}");
                 }
-                
+
                 // Применяем инлайн к цепочкам, которые можно безопасно сократить
                 var inlineableChains = callChains.Where(c => c.CanInline).ToList();
                 if (inlineableChains.Count > 0)
@@ -256,14 +256,14 @@ namespace Deobfuscator
         {
             Console.WriteLine($"[*] Saving to: {path}");
             Log($"Saving to: {path}");
-            
+
             var opts = new ModuleWriterOptions(_module)
             {
                 Logger = DummyLogger.NoThrowInstance,
                 MetadataOptions = new MetadataOptions { Flags = MetadataFlags.KeepOldMaxStack }
             };
             _module.Write(path, opts);
-            
+
             Console.WriteLine("[+] Done.");
             Log("Saved successfully.");
         }
